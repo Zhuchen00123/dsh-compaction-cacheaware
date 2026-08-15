@@ -13,6 +13,13 @@ compaction realm. It does **not** modify other plugins, presets, or host files.
 > [DSH 创意工坊](https://github.com/JxaMe/dsh-workshop) 自动扫描收录。
 > 在线地址：<https://JxaMe.github.io/dsh-workshop/>
 
+## Docs
+
+- [PROJECT.md](docs/PROJECT.md) — 项目说明与维护入口
+- [MAINTENANCE.md](docs/MAINTENANCE.md) — 维护手册
+- [MIGRATION_BRIEF.md](docs/MIGRATION_BRIEF.md) — 迁移交接说明
+- [reasonix_compact_design.md](docs/reasonix_compact_design.md) — Reasonix 原始设计
+
 ## What it ports from Reasonix
 
 - **One automatic trigger**: `compact_ratio` (default `0.85`), not multiple
