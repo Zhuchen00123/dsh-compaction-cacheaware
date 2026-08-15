@@ -1,0 +1,101 @@
+# dsh-compaction-cacheaware
+
+Reasonix-style **cache-aware compaction** backend for DeepSeek Harness (DSH).
+
+This is a standalone, modular DSH plugin. It implements the official
+`@deepseek-ai/dsh-compaction` seam (`ctx.compaction`) and is designed to be
+mounted **instead of** `@deepseek-ai/dsh-compaction-basic` inside a preset's
+compaction realm. It does **not** modify other plugins, presets, or host files.
+
+## What it ports from Reasonix
+
+- **One automatic trigger**: `compact_ratio` (default `0.85`), not multiple
+  soft/snip/force thresholds.
+- **One structured checkpoint**: stable prefix + one summary + recent tail.
+- **Recent tail budget**: `clamp(window×10%, 32K, 96K)`.
+- **Checkpoint acceptance**: normal candidates ≤ 50% of window and below the
+  trigger; exceptional fixed-prefix path requires ≥25% savings.
+- **Canonical transcript preserved**: DSH's surface `replace` shadows the old
+  range in the model-visible projection only; the raw session log remains the
+  source of truth.
+- **One summarizer call per transaction**: no application-layer retry loops.
+- **Reasonix summary headings**: `Standing facts & constraints`, `Goal`,
+  `Decisions & rationale`, `Files & code`, `Commands & outcomes`,
+  `Errors & fixes`, `Pending & next step`.
+
+## Install / build
+
+```bash
+pnpm install
+pnpm build
+```
+
+The compiled plugin is `lib/index.js` and can be loaded by file path:
+
+```yaml
+# In your agent preset's compaction realm, replace:
+#   - id: compaction-basic
+#     name: '@deepseek-ai/dsh-compaction-basic'
+# with:
+- id: compaction-cacheaware
+  name: 'file:///absolute/path/to/dsh-compaction-cacheaware/lib/index.js'
+  config:
+    compactRatio: 0.85
+    checkpointCeilingRatio: 0.5
+    recentTailRatio: 0.1
+    recentTailMinTokens: 32768
+    recentTailMaxTokens: 98304
+    summaryMaxTokens: 16384
+```
+
+Keep `@deepseek-ai/dsh-command-compact` in the same realm so `/compact` uses
+this backend. The optional `@deepseek-ai/dsh-compaction-tool-result-pruner` can
+still be mounted as a sibling; this plugin reads it through `ctx.get()`.
+
+## Configuration
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `compactRatio` | `0.85` | Sole automatic trigger fraction. |
+| `checkpointCeilingRatio` | `0.5` | Normal auto-checkpoint acceptance ceiling. |
+| `recentTailRatio` | `0.1` | Recent verbatim tail fraction. |
+| `recentTailMinTokens` | `32768` | Lower bound for production tail. |
+| `recentTailMaxTokens` | `98304` | Upper bound for production tail. |
+| `summaryMaxTokens` | `16384` | Summarizer output cap. |
+| `exceptionalMinSavingsRatio` | `0.25` | Required savings when fixed prefix exceeds ceiling. |
+| `minRecentKeep` | `2` | Minimum recent messages kept. |
+| `minCompactMessages` | `2` | Minimum compactable messages. |
+| `maxPinnedFirstUserTokens` | `1500` | Pin first user turn if ≤ this. |
+| `pinnedFirstUserWindowFrac` | `0.15` | First-user pin window fraction cap. |
+| `protocolReserveTokens` | `256` | Framing reserve. |
+| `summarizationProvider` / `summarizationModel` | `''` | Optional summary route; defaults to conversation route. |
+| `auto` | `true` | Register automatic pressure/overflow listeners. |
+
+## Modularity
+
+- The plugin only registers `ctx.compaction` and its own automatic listeners.
+- It does not edit `dsh-wsl-bash`, `dsh-team-dashboard`, `router-opencode-wsl`,
+  or any other plugin.
+- To use it, mount it in your own preset or profile patch; see
+  `cordis.patch.example.yml` in this package.
+
+## Keeping in sync with Reasonix
+
+`scripts/sync-reasonix-compact.mjs` and the GitHub Action in
+`.github/workflows/sync-reasonix-compact.yml` watch
+`esengine/DeepSeek-Reasonix` and open/update a PR when the upstream compact
+implementation changes. The sync job:
+
+1. Fetches the latest `main-v2` Reasonix source.
+2. Updates `vendor/reasonix/compact/` with the upstream compact files and
+   design docs.
+3. Regenerates `src/generated/reasonix-constants.ts` from the Go constants and
+   summary prompt (when they change).
+4. Commits and opens a PR with a summary of what changed.
+
+The generated constants are imported by this package so tuning values stay
+traceable to upstream.
+
+## License
+
+MIT

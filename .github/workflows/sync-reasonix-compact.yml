@@ -1,0 +1,57 @@
+name: Sync Reasonix compact
+
+on:
+  schedule:
+    # Every 6 hours: catch upstream compact changes without spamming.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Sync Reasonix compact
+        run: node scripts/sync-reasonix-compact.mjs
+
+      - name: Detect changes
+        id: git
+        run: |
+          if ! git diff --quiet; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create/update PR
+        if: steps.git.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: 'chore(reasonix): sync compact implementation'
+          branch: reasonix-compact-sync
+          delete-branch: true
+          title: 'Sync Reasonix compact implementation'
+          body: |
+            Automated sync from `esengine/DeepSeek-Reasonix`.
+
+            This PR updates:
+            - `vendor/reasonix/compact/` (upstream compact source/docs)
+            - `src/generated/reasonix-constants.ts`
+
+            Review the diff before merging. If upstream introduced structural
+            changes that the TS port does not yet handle, update the plugin code
+            in the same PR.
+          labels:
+            - dependencies
+            - reasonix

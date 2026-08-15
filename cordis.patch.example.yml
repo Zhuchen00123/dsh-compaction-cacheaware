@@ -1,0 +1,19 @@
+# Example: replace compaction-basic with dsh-compaction-cacheaware in your own
+# preset/profile. This patch is intentionally standalone and does not touch any
+# other plugin. Adjust the file URL to your checkout.
+#
+# Apply as a --patch overlay, or merge into your agent preset's compaction realm.
+#
+# - id: compaction-basic
+#   disabled: true
+#
+# - insert:
+#     - id: compaction-cacheaware
+#       name: 'file:///F:/codexprojects/deepseek-harnes/packages/dsh-compaction-cacheaware/lib/index.js'
+#       config:
+#         compactRatio: 0.85
+#         checkpointCeilingRatio: 0.5
+#         recentTailRatio: 0.1
+#         recentTailMinTokens: 32768
+#         recentTailMaxTokens: 98304
+#         summaryMaxTokens: 16384
