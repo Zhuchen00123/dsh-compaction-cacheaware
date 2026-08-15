@@ -96,6 +96,27 @@ implementation changes. The sync job:
 The generated constants are imported by this package so tuning values stay
 traceable to upstream.
 
+## Publish to GitHub / DSH Workshop
+
+This repository is designed to be published as a standalone public GitHub repo.
+The DSH creative workshop discovers public repos with the `dsh-plugin` topic.
+
+```bash
+# 1. Authenticate GitHub CLI once
+gh auth login
+
+# 2. From this repository root, publish and add workshop topics
+./scripts/publish.sh dsh-compaction-cacheaware
+```
+
+`scripts/publish.sh` will:
+
+1. Create a public GitHub repo and push this repository.
+2. Add `dsh-plugin`, `deepseek-harness`, and `reasonix` topics.
+
+After that, the workshop index at <https://JxaMe.github.io/dsh-workshop/>
+will pick it up automatically (it scans `dsh-plugin` topic repositories).
+
 ## License
 
 MIT
