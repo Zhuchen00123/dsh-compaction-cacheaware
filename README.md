@@ -7,6 +7,12 @@ This is a standalone, modular DSH plugin. It implements the official
 mounted **instead of** `@deepseek-ai/dsh-compaction-basic` inside a preset's
 compaction realm. It does **not** modify other plugins, presets, or host files.
 
+> 🐋 收录于 DSH 创意工坊
+>
+> 本仓库打上 `dsh-plugin` topic 后，会被
+> [DSH 创意工坊](https://github.com/JxaMe/dsh-workshop) 自动扫描收录。
+> 在线地址：<https://JxaMe.github.io/dsh-workshop/>
+
 ## What it ports from Reasonix
 
 - **One automatic trigger**: `compact_ratio` (default `0.85`), not multiple
