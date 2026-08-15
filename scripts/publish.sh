@@ -4,9 +4,11 @@
 # DeepSeek Harness creative workshop.
 #
 # Prerequisites:
-#   - gh CLI installed and authenticated: gh auth login
+#   - gh CLI installed and authenticated.
+#     On Windows/WSL the script will prefer `gh.exe` when the WSL `gh` is not
+#     authenticated.
 #   - This script is run from the repository root:
-#       cd dsh-compaction-cacheaware
+#       cd compaction-reasonix
 #       ./scripts/publish.sh [repo-name]
 #
 # What it does:
@@ -20,27 +22,33 @@ set -euo pipefail
 
 REPO_NAME="${1:-dsh-compaction-cacheaware}"
 
-if ! gh auth status &>/dev/null; then
-  echo "❌ gh is not authenticated. Run: gh auth login"
+# Prefer the authenticated gh. On WSL, `gh.exe` often holds the Windows login.
+GH_BIN="${GH_BIN:-gh}"
+if ! "${GH_BIN}" auth status &>/dev/null && command -v gh.exe &>/dev/null; then
+  GH_BIN="gh.exe"
+fi
+
+if ! "${GH_BIN}" auth status &>/dev/null; then
+  echo "❌ gh is not authenticated. Run: gh auth login  (or gh.exe auth login on Windows)"
   exit 1
 fi
 
-OWNER="$(gh api user -q .login)"
+OWNER="$("${GH_BIN}" api user -q .login)"
 REPO="${OWNER}/${REPO_NAME}"
 
-if gh repo view "${REPO}" &>/dev/null; then
+if "${GH_BIN}" repo view "${REPO}" &>/dev/null; then
   echo "ℹ️  Repo already exists: ${REPO}"
   git remote remove origin 2>/dev/null || true
   git remote add origin "https://github.com/${REPO}.git"
 else
   echo "🚀 Creating public repo ${REPO} ..."
-  gh repo create "${REPO_NAME}" --public --source . --remote origin --push
+  "${GH_BIN}" repo create "${REPO_NAME}" --public --source . --remote origin --push
 fi
 
 echo "🏷️  Adding workshop/discoverability topics ..."
-gh repo edit "${REPO}" --add-topic dsh-plugin
-gh repo edit "${REPO}" --add-topic deepseek-harness
-gh repo edit "${REPO}" --add-topic reasonix
+"${GH_BIN}" repo edit "${REPO}" --add-topic dsh-plugin
+"${GH_BIN}" repo edit "${REPO}" --add-topic deepseek-harness
+"${GH_BIN}" repo edit "${REPO}" --add-topic reasonix
 
 echo "✅ Published: https://github.com/${REPO}"
 echo "✅ Workshop discoverability enabled via topic 'dsh-plugin'."
