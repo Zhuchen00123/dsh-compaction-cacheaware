@@ -3,6 +3,28 @@
   "version": "0.1.0",
   "description": "Reasonix-style cache-aware compaction backend for DeepSeek Harness (DSH). Replaces/enhances compaction-basic with compact_ratio, one structured summary checkpoint, and a stable recent tail.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zhuchen00123/dsh-compaction-cacheaware.git"
+  },
+  "homepage": "https://github.com/Zhuchen00123/dsh-compaction-cacheaware#readme",
+  "bugs": {
+    "url": "https://github.com/Zhuchen00123/dsh-compaction-cacheaware/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "compaction",
+    "reasonix",
+    "cache-aware",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -23,6 +45,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run typecheck && npm run build",
     "sync:reasonix": "node scripts/sync-reasonix-compact.mjs"
   },
   "peerDependencies": {

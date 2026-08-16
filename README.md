@@ -38,18 +38,47 @@ compaction realm. It does **not** modify other plugins, presets, or host files.
 
 ## Install / build
 
+### 安装到 DSH profile（推荐）
+
+通过 GitHub 安装（preset 里使用包名 `dsh-compaction-cacheaware`，不再依赖本地绝对路径）：
+
+```powershell
+cd "$env:USERPROFILE\.dsh\profiles\web"
+pnpm add dsh-compaction-cacheaware@github:Zhuchen00123/dsh-compaction-cacheaware
+```
+
+发布到 npm registry 后可直接：
+
+```powershell
+pnpm add dsh-compaction-cacheaware
+```
+
+### 本地开发 / 构建
+
 ```bash
 pnpm install
 pnpm build
 ```
 
-The compiled plugin is `lib/index.js` and can be loaded by file path:
+然后在 preset 的 compaction realm 里替换：
 
 ```yaml
-# In your agent preset's compaction realm, replace:
-#   - id: compaction-basic
-#     name: '@deepseek-ai/dsh-compaction-basic'
-# with:
+# - id: compaction-basic
+#   name: '@deepseek-ai/dsh-compaction-basic'
+- id: compaction-cacheaware
+  name: 'dsh-compaction-cacheaware'
+  config:
+    compactRatio: 0.85
+    checkpointCeilingRatio: 0.5
+    recentTailRatio: 0.1
+    recentTailMinTokens: 32768
+    recentTailMaxTokens: 98304
+    summaryMaxTokens: 16384
+```
+
+如果从源码本地调试，也可以直接用编译产物路径：
+
+```yaml
 - id: compaction-cacheaware
   name: 'file:///absolute/path/to/dsh-compaction-cacheaware/lib/index.js'
   config:
