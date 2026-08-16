@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Zhuchen00123/dsh-compaction-cacheaware.git"
+    "url": "git+https://github.com/Zhuchen00123/dsh-compaction-cacheaware.git"
   },
   "homepage": "https://github.com/Zhuchen00123/dsh-compaction-cacheaware#readme",
   "bugs": {
