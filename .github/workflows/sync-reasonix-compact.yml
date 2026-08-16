@@ -52,6 +52,4 @@ jobs:
             Review the diff before merging. If upstream introduced structural
             changes that the TS port does not yet handle, update the plugin code
             in the same PR.
-          labels:
-            - dependencies
-            - reasonix
+          labels: dependencies, reasonix
