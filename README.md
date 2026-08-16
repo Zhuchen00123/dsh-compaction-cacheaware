@@ -40,17 +40,17 @@ compaction realm. It does **not** modify other plugins, presets, or host files.
 
 ### 安装到 DSH profile（推荐）
 
-通过 GitHub 安装（preset 里使用包名 `dsh-compaction-cacheaware`，不再依赖本地绝对路径）：
+已发布到 npm registry，直接安装：
 
 ```powershell
 cd "$env:USERPROFILE\.dsh\profiles\web"
-pnpm add dsh-compaction-cacheaware@github:Zhuchen00123/dsh-compaction-cacheaware
+pnpm add dsh-compaction-cacheaware
 ```
 
-发布到 npm registry 后可直接：
+也可以从 GitHub 安装：
 
 ```powershell
-pnpm add dsh-compaction-cacheaware
+pnpm add dsh-compaction-cacheaware@github:Zhuchen00123/dsh-compaction-cacheaware
 ```
 
 ### 本地开发 / 构建
