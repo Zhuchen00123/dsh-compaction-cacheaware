@@ -15,7 +15,7 @@
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter'
-import { toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
+import { toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import type { CacheAwareCompactSpec, ResolvedCacheAwareConfig } from './config.js'
 import { SUMMARY_OPEN_TAG } from './prompt.js'
 
@@ -69,6 +69,27 @@ function isUserMessage(message: Message): boolean {
   return message.role === 'user'
 }
 
+/** Assert the token-meter surface and the live session surface are identical. */
+function assertSurfaceMatchesMeasurement(session: Session, nodes: readonly TokenSurfaceNode[]): void {
+  const surfaceNodes = session.surface.nodes
+  if (surfaceNodes.length !== nodes.length || surfaceNodes.some((seq, index) => seq !== nodes[index]?.seq)) {
+    throw new Error('compaction: token-meter surface does not match the current session surface')
+  }
+}
+
+/** True when a surface node is a tool result (never a legal tail start). */
+function isToolResultNode(session: Session, seq: number): boolean {
+  const event = session.events[seq]
+  if (!event || event.seq !== seq) return false
+  if (event.type === 'tool/result') return true
+  if (event.type === 'user/message') {
+    const data = event.data as { content?: readonly ContentBlock[]; message?: { content?: readonly ContentBlock[] } }
+    const content = data.message?.content ?? data.content
+    return Array.isArray(content) && content.some((block) => block.type === 'tool-result')
+  }
+  return false
+}
+
 /** Index of the first surface node that may be folded (stable prefix end). */
 function pinnedPrefixEnd(
   messages: readonly Message[],
@@ -102,6 +123,7 @@ export function selectReasonixRange(
 ): SelectedRange | null {
   const messages = session.deriveMessages()
   const nodes = measurement.nodes
+  assertSurfaceMatchesMeasurement(session, nodes)
   if (nodes.length === 0 || messages.length === 0) return null
 
   const head = pinnedPrefixEnd(messages, nodes, config, spec, meter)
@@ -119,6 +141,11 @@ export function selectReasonixRange(
   while (startIdx > head && startIdx < nodes.length && !toolPairingBalancedBefore(session, nodes[startIdx]!.seq)) {
     startIdx--
   }
+  // Defensive: even if the balance helper disagrees, never start the tail on a
+  // tool result whose tool-call would be shadowed.
+  while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
+    startIdx--
+  }
 
   // Preserve protected messages ([[keep]] user turns, error tool results) by
   // moving the fold boundary before the earliest protected message in the fold.
@@ -128,8 +155,16 @@ export function selectReasonixRange(
       break
     }
   }
+  // Re-align after protected-message moves (a protected error tool result must
+  // not become an orphan at the tail start).
+  while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
+    startIdx--
+  }
   // After alignment startIdx may equal head; re-check minimum compactable span.
   if (startIdx - head < config.minCompactMessages) return null
+  if (startIdx < nodes.length && !toolPairingBalancedBefore(session, nodes[startIdx]!.seq)) {
+    throw new Error('compaction: tail start is not tool-pairing balanced')
+  }
 
   const endIdx = startIdx - 1
   const shadowed = nodes.slice(head, startIdx)
@@ -151,10 +186,15 @@ export function selectOverflowRange(
 ): SelectedRange | null {
   const messages = session.deriveMessages()
   const nodes = measurement.nodes
+  assertSurfaceMatchesMeasurement(session, nodes)
   if (nodes.length === 0 || messages.length === 0) return null
   const head = 0
   let startIdx = Math.max(head, nodes.length - config.minRecentKeep)
   while (startIdx > head && startIdx < nodes.length && !toolPairingBalancedBefore(session, nodes[startIdx]!.seq)) {
+    startIdx--
+  }
+  // Defensive: never start the tail on a tool result.
+  while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
     startIdx--
   }
   for (let i = head; i < startIdx; i++) {
@@ -163,7 +203,14 @@ export function selectOverflowRange(
       break
     }
   }
+  // Re-align after protected-message moves.
+  while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
+    startIdx--
+  }
   if (startIdx - head < config.minCompactMessages) return null
+  if (startIdx < nodes.length && !toolPairingBalancedBefore(session, nodes[startIdx]!.seq)) {
+    throw new Error('compaction: tail start is not tool-pairing balanced')
+  }
   const shadowed = nodes.slice(head, startIdx)
   return {
     start: shadowed[0]!.seq,
