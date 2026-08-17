@@ -390,7 +390,15 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
         signal?.throwIfAborted()
       }
     }
-    if (lastError !== undefined) throw lastError
+    if (lastError !== undefined) {
+      // Preserve every candidate failure in the durable compaction/end error.
+      // Throwing only the last error made a multi-provider failure look like a
+      // single unexplained summary failure in the session log.
+      const aggregate = new Error(`all summarization candidates failed: ${attempts.join('; ')}`, { cause: lastError })
+      const code = (lastError as { code?: unknown })?.code
+      if (typeof code === 'string') (aggregate as Error & { code?: string }).code = code
+      throw aggregate
+    }
     throw new Error(`all summarization candidates exhausted: ${attempts.join('; ')}`)
   }
 
@@ -581,7 +589,15 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       const sourceTokens = measurement.totalTokens
       const candidateTokens = sourceTokens - range.shadowedTokenCount + framedSummaryTokenCount
       const fixedPrefix = fixedPrefixTokens(measurement, range.startIdx)
-      const spec = await this._specFor(agent, signal)
+      // The summarizer may have fallen back to a different provider/model than
+      // the conversation's latest routed target. Price and validate the
+      // checkpoint against the route that actually produced the summary; using
+      // routedTarget() here can re-contact a dead provider and turn a successful
+      // fallback into a misleading generic "summary" failure.
+      const spec = await this._specFor(agent, signal, {
+        provider: summaryResult.provider,
+        model: summaryResult.model,
+      })
       if (spec !== null) {
         acceptCheckpointCandidate({
           trigger: options.trigger,
@@ -716,8 +732,12 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     }
   }
 
-  private async _specFor(agent: Agent, signal?: AbortSignal): Promise<CacheAwareCompactSpec | null> {
-    const target = routedTarget(agent.session) ?? conversationTarget(agent)
+  private async _specFor(
+    agent: Agent,
+    signal?: AbortSignal,
+    preferredTarget?: { provider: string; model: string },
+  ): Promise<CacheAwareCompactSpec | null> {
+    const target = preferredTarget ?? routedTarget(agent.session) ?? conversationTarget(agent)
     if (target === undefined) return null
     const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
     if (context === undefined) return null

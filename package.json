@@ -1,6 +1,6 @@
 {
   "name": "dsh-compaction-cacheaware",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Reasonix-style cache-aware compaction backend for DeepSeek Harness (DSH). Replaces/enhances compaction-basic with compact_ratio, one structured summary checkpoint, and a stable recent tail.",
   "license": "MIT",
   "repository": {
