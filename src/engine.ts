@@ -295,7 +295,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     if (/checkpoint rejected|summary is not smaller|SurfaceChanged|would not reduce tokens/i.test(msg)) return false
     const code = (error as { code?: unknown })?.code ?? (error as { cause?: { code?: unknown } })?.cause?.code
     if (typeof code === 'string' && /proxy_error|QUOTA|BAD_REQUEST|exhausted|unreachable|MAX_TOKENS|UNSUPPORTED_CONTENT/i.test(code)) return true
-    if (/all upstreams exhausted|unreachable|proxy_error|BAD_REQUEST|QUOTA|ECONN|ETIMEDOUT|ENOTFOUND|exhausted/i.test(msg)) return true
+    if (/all upstreams exhausted|unreachable|proxy_error|invalid_prompt|invalid request|unsupported prompt|BAD_REQUEST|QUOTA|ECONN|ETIMEDOUT|ENOTFOUND|exhausted/i.test(msg)) return true
     // LlmError transport failures are retriable; keep logic conservative
     if (error instanceof LlmError) return /proxy_error|exhausted|unreachable/i.test((error as { code?: string }).code ?? '') || /proxy_error|exhausted|unreachable/i.test(msg)
     return false
