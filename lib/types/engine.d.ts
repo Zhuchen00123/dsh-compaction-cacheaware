@@ -90,6 +90,9 @@ export declare class CacheAwareCompactionEngine extends CompactionEngine {
     private readonly overflowAgents;
     constructor(ctx: Context, config?: CacheAwareCompactionConfig);
     private _registerAutomaticCompaction;
+    private isRetriableSummarizeError;
+    private buildSummarizationCandidates;
+    private summarizeWithCandidate;
     protected summarize(input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult>;
     compactIfNeeded(agent: Agent, trigger: CompactionTrigger, signal: AbortSignal): Promise<CompactionResult | null>;
     compactRegion(start: number, end: number, agent: Agent, signal?: AbortSignal): Promise<CompactionResult>;

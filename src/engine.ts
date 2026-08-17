@@ -271,14 +271,70 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     })
   }
 
-  protected async summarize(input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult> {
-    const target = conversationTarget(agent)
-    const provider = this.config.summarizationProvider || target?.provider
-    const model = this.config.summarizationModel || target?.model
-    if (!provider || !model) {
-      throw new Error('no provider/model available for summarization: set CacheAwareCompactionConfig summarization fields, route one request, or set both AgentOptions fields')
-    }
+  private isRetriableSummarizeError(error: unknown): boolean {
+    const msg = error instanceof Error ? error.message : String(error)
+    if (/checkpoint rejected|summary is not smaller|SurfaceChanged|would not reduce tokens/i.test(msg)) return false
+    const code = (error as { code?: unknown })?.code ?? (error as { cause?: { code?: unknown } })?.cause?.code
+    if (typeof code === 'string' && /proxy_error|QUOTA|BAD_REQUEST|exhausted|unreachable|MAX_TOKENS|UNSUPPORTED_CONTENT/i.test(code)) return true
+    if (/all upstreams exhausted|unreachable|proxy_error|BAD_REQUEST|QUOTA|ECONN|ETIMEDOUT|ENOTFOUND|exhausted/i.test(msg)) return true
+    // LlmError transport failures are retriable; keep logic conservative
+    if (error instanceof LlmError) return /proxy_error|exhausted|unreachable/i.test((error as { code?: string }).code ?? '') || /proxy_error|exhausted|unreachable/i.test(msg)
+    return false
+  }
 
+  private async buildSummarizationCandidates(agent: Agent, signal?: AbortSignal): Promise<Array<{ provider: string; model: string }>> {
+    const candidates: Array<{ provider: string; model: string }> = []
+    const seen = new Set<string>()
+    const push = (provider: string, model: string): void => {
+      if (!provider || !model) return
+      const key = `${provider}\0${model}`
+      if (seen.has(key)) return
+      seen.add(key)
+      candidates.push({ provider, model })
+    }
+    if (this.config.summarizationProvider && this.config.summarizationModel) {
+      push(this.config.summarizationProvider, this.config.summarizationModel)
+    }
+    const conv = conversationTarget(agent)
+    if (conv) push(conv.provider, conv.model)
+    try {
+      const providers = this.ctx.llm.listProviders() as unknown as Array<{ provider?: string; id?: string } | string>
+      for (const entry of providers) {
+        const providerName = typeof entry === 'string' ? entry : (entry.provider ?? entry.id ?? '')
+        if (!providerName) continue
+        try {
+          const models = (await this.ctx.llm.listModels(providerName)) as unknown as Array<{ id?: string; provider?: string }>
+          for (const m of models) {
+            const modelId = m.id ?? ''
+            if (!modelId) continue
+            try {
+              const info = await this.ctx.llm.resolveModelInfo(providerName, modelId, signal)
+              if (info?.context?.contextWindow) {
+                push(providerName, modelId)
+                break
+              }
+            } catch {
+              // try next model
+            }
+          }
+        } catch {
+          // provider discovery failed, continue
+        }
+        if (candidates.length >= 4) break
+      }
+    } catch {
+      // discovery unavailable
+    }
+    return candidates
+  }
+
+  private async summarizeWithCandidate(
+    provider: string,
+    model: string,
+    input: SummarizationInput,
+    agent: Agent,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
     const assembler = new BlockAssembler()
     const messages = [
       ...input.messages,
@@ -298,7 +354,6 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       purpose: 'compaction' as const,
       ...(signal === undefined ? {} : { signal }),
     }
-
     for await (const chunk of this.ctx.llm.stream(options)) assembler.push(chunk)
     const error = finishError(assembler.finish)
     if (error !== undefined) throw error
@@ -314,6 +369,29 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       maxTokens: this.config.summaryMaxTokens,
       ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
     }
+  }
+
+  protected async summarize(input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult> {
+    const candidates = await this.buildSummarizationCandidates(agent, signal)
+    if (candidates.length === 0) {
+      throw new Error('no provider/model available for summarization: set CacheAwareCompactionConfig summarization fields, route one request, or set both AgentOptions fields')
+    }
+    const attempts: string[] = []
+    let lastError: unknown
+    for (const candidate of candidates.slice(0, 3)) {
+      try {
+        return await this.summarizeWithCandidate(candidate.provider, candidate.model, input, agent, signal)
+      } catch (error) {
+        lastError = error
+        const msg = error instanceof Error ? error.message : String(error)
+        attempts.push(`${candidate.provider}/${candidate.model}: ${msg}`)
+        if (!this.isRetriableSummarizeError(error)) throw error
+        this.ctx.logger.warn(`compact summarize ${candidate.provider}/${candidate.model} failed: ${msg}; trying next candidate`)
+        signal?.throwIfAborted()
+      }
+    }
+    if (lastError !== undefined) throw lastError
+    throw new Error(`all summarization candidates exhausted: ${attempts.join('; ')}`)
   }
 
   async compactIfNeeded(agent: Agent, trigger: CompactionTrigger, signal: AbortSignal): Promise<CompactionResult | null> {
@@ -406,6 +484,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
         }
       })
     } catch (error) {
+      if (error instanceof ManualCompactionError) throw error
       throw new ManualCompactionError('busy', 'manual compaction requires an idle agent with no waking queued work', { cause: error })
     }
   }
