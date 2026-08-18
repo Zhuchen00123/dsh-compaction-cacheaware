@@ -2,8 +2,9 @@ name: Sync Reasonix compact
 
 on:
   schedule:
-    # Every 6 hours: catch upstream compact changes without spamming.
-    - cron: '0 */6 * * *'
+    # Weekly review is sufficient for an upstream compact design sync.
+    # Sunday 03:00 UTC.
+    - cron: '0 3 * * 0'
   workflow_dispatch:
   push:
     branches:
@@ -28,6 +29,13 @@ jobs:
       - name: Sync Reasonix compact
         run: node scripts/sync-reasonix-compact.mjs
 
+      - name: Validate generated package
+        run: |
+          npm install --no-package-lock --ignore-scripts --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          npm test
+
       - name: Detect changes
         id: git
         run: |
@@ -49,10 +57,11 @@ jobs:
             Automated sync from `esengine/DeepSeek-Reasonix`.
 
             This PR updates:
-            - `vendor/reasonix/compact/` (upstream compact source/docs)
-            - `src/generated/reasonix-constants.ts`
+            - `vendor/reasonix/compact/` (compatible upstream compact source/docs)
+            - `src/generated/reasonix-constants.ts` and compiled `lib/`
 
-            Review the diff before merging. If upstream introduced structural
-            changes that the TS port does not yet handle, update the plugin code
-            in the same PR.
+            The sync is compatibility-gated: structural upstream rewrites are
+            skipped and reported for a manual port review. Local compact trigger
+            and recent-tail policy values are intentionally preserved.
+            Review the diff before merging.
           labels: dependencies, reasonix
