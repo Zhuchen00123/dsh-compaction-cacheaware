@@ -366,6 +366,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
         if (!providerName) continue
         try {
           const models = (await this.ctx.llm.listModels(providerName)) as unknown as Array<{ id?: string; provider?: string }>
+          let providerCandidates = 0
           for (const m of models) {
             const modelId = m.id ?? ''
             if (!modelId) continue
@@ -373,7 +374,11 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
               const info = await this.ctx.llm.resolveModelInfo(providerName, modelId, signal)
               if (info?.context?.contextWindow) {
                 push(providerName, modelId)
-                break
+                providerCandidates += 1
+                // Keep several models per route. A provider may expose one
+                // exhausted model and another usable model; taking only the
+                // first model made fallback discovery appear provider-bound.
+                if (providerCandidates >= 3) break
               }
             } catch {
               // try next model
@@ -382,7 +387,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
         } catch {
           // provider discovery failed, continue
         }
-        if (candidates.length >= 4) break
+        if (candidates.length >= 12) break
       }
     } catch {
       // discovery unavailable
@@ -440,7 +445,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     }
     const attempts: string[] = []
     let lastError: unknown
-    for (const candidate of candidates.slice(0, 3)) {
+    for (const candidate of candidates.slice(0, 12)) {
       try {
         return await this.summarizeWithCandidate(candidate.provider, candidate.model, input, agent, signal)
       } catch (error) {
