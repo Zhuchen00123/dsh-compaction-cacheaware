@@ -31,7 +31,7 @@ jobs:
 
       - name: Validate generated package
         run: |
-          npm install --no-package-lock --ignore-scripts --no-audit --no-fund
+          npm install --legacy-peer-deps --no-package-lock --ignore-scripts --no-audit --no-fund
           npm run typecheck
           npm run build
           npm test
