@@ -161,14 +161,15 @@ function assertCompactionInactive(unmatchedCompactionStart: SessionEvent | undef
 }
 
 function sanitizeSummarizationMessage(message: Message): Message {
-  if (message.role !== 'assistant' || !message.content.some((block) => block.type === 'reasoning')) return message
+  if (message.role !== 'assistant') return message
 
-  // Reasoning blocks are provider-private response items. Replaying their
-  // encrypted signatures in a fresh compaction request is not portable: the
-  // OpenAI Responses API may reject them when the new request has reasoning
-  // disabled (as Console Go does with invalid_prompt). They are not needed to
-  // preserve the user-visible/tool transcript, so drop them and invalidate the
-  // adapter replay envelope while retaining text and tool-call blocks.
+  // Reasoning blocks and replayState are provider-private response items.
+  // Replaying either in a fresh compaction request is not portable: the OpenAI
+  // Responses API may reject old encrypted/items when the new request has
+  // different reasoning settings (as Console Go does with invalid_prompt).
+  // This must run for every assistant message, including text/tool-call-only
+  // messages whose durable content no longer exposes a reasoning block but
+  // whose source still carries adapter replay metadata.
   return {
     ...message,
     content: message.content.filter((block) => block.type !== 'reasoning'),
