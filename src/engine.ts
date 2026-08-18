@@ -360,18 +360,19 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     const conv = conversationTarget(agent)
     if (conv) push(conv.provider, conv.model)
     try {
-      const providers = this.ctx.llm.listProviders() as unknown as Array<{ provider?: string; id?: string } | string>
+      const llm = this.ctx.get('llm')!
+      const providers = llm.listProviders() as unknown as Array<{ provider?: string; id?: string } | string>
       for (const entry of providers) {
         const providerName = typeof entry === 'string' ? entry : (entry.provider ?? entry.id ?? '')
         if (!providerName) continue
         try {
-          const models = (await this.ctx.llm.listModels(providerName)) as unknown as Array<{ id?: string; provider?: string }>
+          const models = (await llm.listModels(providerName)) as unknown as Array<{ id?: string; provider?: string }>
           let providerCandidates = 0
           for (const m of models) {
             const modelId = m.id ?? ''
             if (!modelId) continue
             try {
-              const info = await this.ctx.llm.resolveModelInfo(providerName, modelId, signal)
+              const info = await llm.resolveModelInfo(providerName, modelId, signal)
               if (info?.context?.contextWindow) {
                 push(providerName, modelId)
                 providerCandidates += 1
@@ -421,7 +422,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       purpose: 'compaction' as const,
       ...(signal === undefined ? {} : { signal }),
     }
-    for await (const chunk of this.ctx.llm.stream(options)) assembler.push(chunk)
+    for await (const chunk of this.ctx.get('llm')!.stream(options)) assembler.push(chunk)
     const error = finishError(assembler.finish)
     if (error !== undefined) throw error
     const rawOutput = assembler.blocks()
@@ -515,7 +516,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     }
 
     // pressure
-    const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
+    const context = (await this.ctx.get('llm')!.resolveModelInfo(target.provider, target.model, signal)).context
     const targetKey = `${target.provider}/${target.model}`
     if (context === undefined) {
       throw new TargetPressureConfigError(targetKey, `CacheAwareCompaction: no context capacity for ${targetKey}; configure contextWindow on that adapter model`)
@@ -595,7 +596,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     if (route === undefined) return null
     // Best-effort context capacity for selection; force/overflow may still
     // proceed with a minimal recent tail when the adapter exposes no capacity.
-    const context = (await this.ctx.llm.resolveModelInfo(route.provider, route.model)).context
+    const context = (await this.ctx.get('llm')!.resolveModelInfo(route.provider, route.model)).context
     if (context === undefined) {
       if (force) return selectOverflowRange(agent.session, measurement, this.config)
       return null
@@ -830,7 +831,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
   ): Promise<CacheAwareCompactSpec | null> {
     const target = preferredTarget ?? routedTarget(agent.session) ?? conversationTarget(agent)
     if (target === undefined) return null
-    const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
+    const context = (await this.ctx.get('llm')!.resolveModelInfo(target.provider, target.model, signal)).context
     if (context === undefined) return null
     return resolveCompactSpec(this.config, context.contextWindow)
   }
