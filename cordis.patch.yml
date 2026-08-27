@@ -1,0 +1,7 @@
+# Mount the cache-aware compaction backend in place of the base backend.
+- id: compaction-basic
+  disabled: true
+
+- insert:
+    - id: compaction-cacheaware
+      name: 'dsh-compaction-cacheaware'
