@@ -78,8 +78,8 @@ pnpm build
     compactRatio: 0.85
     checkpointCeilingRatio: 0.5
     recentTailRatio: 0.1
-    recentTailMinTokens: 32768
-    recentTailMaxTokens: 98304
+    recentTailMinTokens: 8192
+    recentTailMaxTokens: 16384
     summaryMaxTokens: 16384
 ```
 
@@ -92,10 +92,15 @@ pnpm build
     compactRatio: 0.85
     checkpointCeilingRatio: 0.5
     recentTailRatio: 0.1
-    recentTailMinTokens: 32768
-    recentTailMaxTokens: 98304
+    recentTailMinTokens: 8192
+    recentTailMaxTokens: 16384
     summaryMaxTokens: 16384
 ```
+
+Note: mounts inside an **agent preset's isolated compaction realm** replace
+`compaction-basic` there directly; the profile-level bundle patch cannot reach
+that realm, so every preset that ships `compaction-basic` in its own compaction
+group must be migrated to this package.
 
 Keep `@deepseek-ai/dsh-command-compact` in the same realm so `/compact` uses
 this backend. The optional `@deepseek-ai/dsh-compaction-tool-result-pruner` can
@@ -108,8 +113,8 @@ still be mounted as a sibling; this plugin reads it through `ctx.get()`.
 | `compactRatio` | `0.85` | Sole automatic trigger fraction. |
 | `checkpointCeilingRatio` | `0.5` | Normal auto-checkpoint acceptance ceiling. |
 | `recentTailRatio` | `0.1` | Recent verbatim tail fraction. |
-| `recentTailMinTokens` | `32768` | Lower bound for production tail. |
-| `recentTailMaxTokens` | `98304` | Upper bound for production tail. |
+| `recentTailMinTokens` | `8192` | Lower bound for production tail (lowered from upstream 32K so compaction still triggers under token-meter underestimation). |
+| `recentTailMaxTokens` | `16384` | Upper bound for production tail (lowered from upstream 96K, same reason). |
 | `summaryMaxTokens` | `16384` | Summarizer output cap. |
 | `exceptionalMinSavingsRatio` | `0.25` | Required savings when fixed prefix exceeds ceiling. |
 | `minRecentKeep` | `2` | Minimum recent messages kept. |
