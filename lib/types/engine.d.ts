@@ -90,6 +90,9 @@ export declare class CacheAwareCompactionEngine extends CompactionEngine {
     private readonly overflowAgents;
     constructor(ctx: Context, config?: CacheAwareCompactionConfig);
     private _registerAutomaticCompaction;
+    private isInvalidPromptError;
+    private sanitizeErrorMessage;
+    private isNonCandidateRetryableError;
     private isRetriableSummarizeError;
     private buildSummarizationCandidates;
     private summarizeWithCandidate;
