@@ -120,6 +120,25 @@ function conversationTarget(agent: Agent): { provider: string; model: string } |
   return { provider: agent.options.provider, model: agent.options.model }
 }
 
+/**
+ * Read the realm's current `ctx.compaction` owner without throwing when no
+ * engine is provided yet (the context proxy raises on unknown services).
+ */
+function readExistingCompactionService(ctx: Context): unknown {
+  try {
+    return (ctx as { compaction?: unknown }).compaction
+  } catch {
+    return undefined
+  }
+}
+
+function describeCompactionEngine(value: unknown): string {
+  if (value instanceof CacheAwareCompactionEngine) return 'dsh-compaction-cacheaware'
+  const name = (value as { constructor?: { name?: string } })?.constructor?.name
+  if (typeof name === 'string' && name.length > 0) return name
+  return typeof value
+}
+
 /** Inspect open-turn, unmatched-compaction, and latest seed-boundary state. */
 function inspectCompactionEntryState(events: readonly SessionEvent[]): {
   openTurn: number | null
@@ -253,11 +272,42 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
   readonly config: ResolvedCacheAwareConfig
   private readonly overflowRetries = new WeakMap<Agent, number>()
   private readonly overflowAgents = new WeakMap<Session, Agent>()
+  private supersededReported = false
 
   constructor(ctx: Context, config: CacheAwareCompactionConfig = {}) {
+    // Peek before super(): ctx.compaction still belongs to whoever was mounted
+    // first, if anyone. A later construction silently takes the seam over.
+    const previous = readExistingCompactionService(ctx)
     super(ctx)
     this.config = resolveConfig(config)
+    if (previous !== undefined && previous !== this) {
+      if (previous instanceof CacheAwareCompactionEngine) {
+        // Replacing our own class is the normal hot-reload path, not a misconfig.
+        ctx.logger.info(`compaction-cacheaware: superseding a previous cache-aware engine instance in this realm (expected during hot reload)`)
+      } else {
+        ctx.logger.warn(`compaction-cacheaware: a compaction engine (${describeCompactionEngine(previous)}) is already mounted in this realm; this mount supersedes it for ctx.compaction. If unintentional, disable the other engine in the same realm — a profile-level bundle patch cannot reach an agent preset's isolated compaction realm, and vice versa.`)
+      }
+    }
     if (this.config.auto) this._registerAutomaticCompaction()
+  }
+
+  /**
+   * Late-takeover detection: if another engine constructed after us now owns
+   * ctx.compaction, our listeners must not race it for automatic compaction.
+   * Warns once, then keeps this instance passive.
+   */
+  private _realmSuperseded(): boolean {
+    const current = readExistingCompactionService(this.ctx)
+    const superseded = current !== undefined && current !== this
+    if (superseded && !this.supersededReported) {
+      this.supersededReported = true
+      this.ctx.logger.warn(`compaction-cacheaware: ctx.compaction was taken over by ${describeCompactionEngine(current)} in this realm; this instance stops automatic compaction. Check the realm's plugin mounts for duplicate compaction backends.`)
+    } else if (!superseded && this.supersededReported) {
+      // Ownership returned (e.g. the other fiber was disposed on hot reload):
+      // re-arm so a future takeover is reported again.
+      this.supersededReported = false
+    }
+    return superseded
   }
 
   private _registerAutomaticCompaction(): void {
@@ -267,6 +317,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     }
 
     ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+      if (this._realmSuperseded()) return next()
       if (!signal.aborted) {
         try {
           const result = await this.compactIfNeeded(agent, 'pressure', signal)
@@ -295,6 +346,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     })
 
     ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => {
+      if (this._realmSuperseded()) return next()
       if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next()
       this.overflowAgents.set(agent.session, agent)
       const target = routedTarget(agent.session)

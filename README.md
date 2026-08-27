@@ -128,6 +128,12 @@ still be mounted as a sibling; this plugin reads it through `ctx.get()`.
 ## Modularity
 
 - The plugin only registers `ctx.compaction` and its own automatic listeners.
+- **Realm self-check (since 0.1.11)**: mounting logs a warning when another
+  compaction engine already owns `ctx.compaction` in the same realm, and if a
+  later mount supersedes this instance, its automatic listeners stand down
+  (warn-once, hot-reload aware) instead of racing the new owner. Note a
+  profile-level bundle patch cannot reach an agent preset's isolated
+  compaction realm — migrate each preset individually.
 - It does not edit `dsh-wsl-bash`, `dsh-team-dashboard`, `router-opencode-wsl`,
   or any other plugin.
 - To use it, mount it in your own preset or profile patch; see

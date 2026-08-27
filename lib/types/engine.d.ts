@@ -88,7 +88,14 @@ export declare class CacheAwareCompactionEngine extends CompactionEngine {
     readonly config: ResolvedCacheAwareConfig;
     private readonly overflowRetries;
     private readonly overflowAgents;
+    private supersededReported;
     constructor(ctx: Context, config?: CacheAwareCompactionConfig);
+    /**
+     * Late-takeover detection: if another engine constructed after us now owns
+     * ctx.compaction, our listeners must not race it for automatic compaction.
+     * Warns once, then keeps this instance passive.
+     */
+    private _realmSuperseded;
     private _registerAutomaticCompaction;
     private isInvalidPromptError;
     private sanitizeErrorMessage;
