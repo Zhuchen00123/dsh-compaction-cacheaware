@@ -7,11 +7,13 @@ This is a standalone, modular DSH plugin. It implements the official
 mounted **instead of** `@deepseek-ai/dsh-compaction-basic` inside a preset's
 compaction realm. It does **not** modify other plugins, presets, or host files.
 
-> 🐋 收录于 DSH 创意工坊
+> 🐋 收录于 DSH 插件社区目录（1024Store）
 >
-> 本仓库打上 `dsh-plugin` topic 后，会被
-> [DSH 创意工坊](https://github.com/JxaMe/dsh-workshop) 自动扫描收录。
-> 在线地址：<https://JxaMe.github.io/dsh-workshop/>
+> 本仓库带 `dsh-plugin` topic，且 `package.json` 声明了有效的
+> `dsh.bundle.patch`（patch 文件随仓库同 revision 提交），可被
+> [awesome-deepseek-harness-plugins](https://github.com/imsai-sh/awesome-deepseek-harness-plugins)
+> 目录的静态校验收录。
+> 在线市场：<https://deepseek1024.com/>
 
 ## Docs
 
@@ -47,6 +49,11 @@ cd "$env:USERPROFILE\.dsh\profiles\web"
 pnpm add dsh-compaction-cacheaware
 ```
 
+本包自带 DSH profile bundle 声明和 `cordis.patch.yml`。将
+`dsh-compaction-cacheaware` 加入 profile 的 `dsh.profile.bundles` 后，DSH
+会自动禁用 `compaction-basic` 并挂载本后端；不要再把同一条插入 patch
+重复添加到 profile 的 `cordis.patch.yml`。
+
 也可以从 GitHub 安装：
 
 ```powershell
@@ -60,7 +67,7 @@ pnpm install
 pnpm build
 ```
 
-然后在 preset 的 compaction realm 里替换：
+如果不使用 profile bundle，也可以在 preset 的 compaction realm 里手动替换：
 
 ```yaml
 # - id: compaction-basic
@@ -138,16 +145,18 @@ implementation changes. The sync job:
 The generated constants are imported by this package so tuning values stay
 traceable to upstream.
 
-## Publish to GitHub / DSH Workshop
+## Publish to GitHub / community catalog
 
 This repository is designed to be published as a standalone public GitHub repo.
-The DSH creative workshop discovers public repos with the `dsh-plugin` topic.
+The [1024Store catalog](https://github.com/imsai-sh/awesome-deepseek-harness-plugins)
+discovers public repos with the `dsh-plugin` topic and statically validates the
+`dsh.bundle.patch` declaration (the patch file must exist in the same tree).
 
 ```bash
 # 1. Authenticate GitHub CLI once
 gh auth login
 
-# 2. From this repository root, publish and add workshop topics
+# 2. From this repository root, publish and add catalog topics
 ./scripts/publish.sh dsh-compaction-cacheaware
 ```
 
@@ -156,8 +165,8 @@ gh auth login
 1. Create a public GitHub repo and push this repository.
 2. Add `dsh-plugin`, `deepseek-harness`, and `reasonix` topics.
 
-After that, the workshop index at <https://JxaMe.github.io/dsh-workshop/>
-will pick it up automatically (it scans `dsh-plugin` topic repositories).
+After that, [deepseek1024.com](https://deepseek1024.com/) lists the entry
+(browse-only until the npm package is published; installs come from npm).
 
 ## License
 
