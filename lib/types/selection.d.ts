@@ -1,17 +1,3 @@
-/**
- * Reasonix-style surface range selection for DSH compaction.
- *
- * DSH's surface is a contiguous ordered list of model-visible nodes; unlike
- * Reasonix's projection model it cannot keep arbitrary middle messages inside
- * a replacement. We therefore approximate Reasonix's retention by:
- *   - pinning a small first user turn as stable prefix,
- *   - keeping a recent tail with the same `clamp(window×10%, 32K, 96K)` budget,
- *   - moving the cut backward to preserve `[[keep]]` user turns and error tool
- *     results that would otherwise be folded,
- *   - never splitting a tool-call/result pair (DSH official boundary helpers).
- *
- * @module dsh-compaction-cacheaware/selection
- */
 import type { Session } from '@deepseek-ai/dsh-session';
 import type { Message } from '@deepseek-ai/dsh-llm';
 import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter';
@@ -24,14 +10,25 @@ export interface SelectedRange {
     startIdx: number;
     endIdx: number;
     shadowedSeqs: number[];
+    /**
+     * Fixed-heuristic price of the shadowed nodes. This is the shadow price the
+     * `compaction/summary` event and the result carry, because the meter folds a
+     * replacement with that same estimator.
+     */
     shadowedTokenCount: number;
+    /**
+     * Route-priced cost of the same nodes. Budgets and the checkpoint acceptance
+     * decision compare against the measured request, so they read this price.
+     */
+    shadowedRouteTokenCount: number;
 }
+/**
+ * Whether a message is a prior compaction digest.
+ *
+ * Mirrors upstream `isCompactionSummary`: a digest is a user-role message whose
+ * content opens with the summary tag.
+ */
 export declare function isCompactionSummaryMessage(message: Message): boolean;
-export declare function isProtectedMessage(message: Message): boolean;
-/** Estimate message tokens with the meter's fixed estimator. */
-export declare function estimateMessageTokens(message: Message, meter: {
-    estimateMessage(message: Message): number;
-}): number;
 /**
  * Choose the recent-tail start index. Walks newest→oldest, growing the tail
  * until the next node would exceed `tailTokens`, then snaps the cut to a
@@ -45,16 +42,18 @@ export declare function selectOverflowRange(session: Session, measurement: Token
 /** Compute the fixed-prefix tokens (request envelope + nodes before the range). */
 export declare function fixedPrefixTokens(measurement: TokenMeasurement, startIdx: number): number;
 /**
- * Reasonix `acceptCheckpointCandidate`: normal path requires candidate ≤ 50%
- * and below trigger; force/overflow may exceed the ceiling only when still
- * below trigger; manual below trigger accepts any real savings.
+ * Reasonix `acceptCheckpointCandidate` at the synced upstream commit.
+ *
+ * Upstream requires real savings and, for automatic maintenance, a result below
+ * the physical input ceiling (`window - outputTokens - protocolReserveTokens`). The former
+ * normal-path 50% checkpoint ceiling, the trigger comparison, and the
+ * exceptional fixed-prefix savings path no longer exist upstream: any strictly
+ * smaller candidate is accepted, and a manual checkpoint may land above the
+ * physical ceiling because it is an explicit rescue.
  */
 export declare function acceptCheckpointCandidate(opts: {
     trigger: string;
-    force: boolean;
     sourceTokens: number;
     candidateTokens: number;
-    fixedPrefixTokens: number;
     spec: CacheAwareCompactSpec;
-    config: ResolvedCacheAwareConfig;
 }): void;

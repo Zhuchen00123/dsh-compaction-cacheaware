@@ -3,15 +3,17 @@
  *
  * DSH's surface is a contiguous ordered list of model-visible nodes; unlike
  * Reasonix's projection model it cannot keep arbitrary middle messages inside
- * a replacement. We therefore approximate Reasonix's retention by:
- *   - pinning a small first user turn as stable prefix,
- *   - keeping a recent tail with the same `clamp(window×10%, 32K, 96K)` budget,
- *   - moving the cut backward to preserve `[[keep]]` user turns and error tool
- *     results that would otherwise be folded,
+ * a replacement. Following upstream at the synced commit, retention is:
+ *   - the system head (`system/message` at surface node 0) as the stable
+ *     prefix — upstream's `pinnedPrefixLen` keeps only the system message, so
+ *     older user turns, failures, and `[[keep]]` markers all enter the summary
+ *     prefix now,
+ *   - a recent verbatim tail of `window × recent_tail_ratio` (16%),
  *   - never splitting a tool-call/result pair (DSH official boundary helpers).
  *
  * @module dsh-compaction-cacheaware/selection
  */
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter'
@@ -27,14 +29,23 @@ export interface SelectedRange {
   startIdx: number
   endIdx: number
   shadowedSeqs: number[]
+  /**
+   * Fixed-heuristic price of the shadowed nodes. This is the shadow price the
+   * `compaction/summary` event and the result carry, because the meter folds a
+   * replacement with that same estimator.
+   */
   shadowedTokenCount: number
+  /**
+   * Route-priced cost of the same nodes. Budgets and the checkpoint acceptance
+   * decision compare against the measured request, so they read this price.
+   */
+  shadowedRouteTokenCount: number
 }
 
 function textOfBlocks(blocks: readonly ContentBlock[]): string {
   let out = ''
   for (const block of blocks) {
     if (block.type === 'text') out += block.text
-    else if (block.type === 'tool-result') out += textOfBlocks(block.content)
   }
   return out
 }
@@ -43,30 +54,14 @@ function textOfMessage(message: Message): string {
   return textOfBlocks(message.content)
 }
 
+/**
+ * Whether a message is a prior compaction digest.
+ *
+ * Mirrors upstream `isCompactionSummary`: a digest is a user-role message whose
+ * content opens with the summary tag.
+ */
 export function isCompactionSummaryMessage(message: Message): boolean {
   return message.role === 'user' && textOfMessage(message).trimStart().startsWith(SUMMARY_OPEN_TAG)
-}
-
-export function isProtectedMessage(message: Message): boolean {
-  const text = textOfMessage(message).trim().toLowerCase()
-  // Tool results in DSH are user-role with a tool-result block; check the
-  // structured error flag before text heuristics.
-  for (const block of message.content) {
-    if (block.type === 'tool-result' && block.isError) return true
-  }
-  if (message.role === 'user') {
-    return text.startsWith('[[keep]]') || text.startsWith('[keep]') || text.startsWith('<keep>') || text.startsWith('<!-- keep -->')
-  }
-  return text.startsWith('error:') || text.startsWith('blocked:')
-}
-
-/** Estimate message tokens with the meter's fixed estimator. */
-export function estimateMessageTokens(message: Message, meter: { estimateMessage(message: Message): number }): number {
-  return meter.estimateMessage(message)
-}
-
-function isUserMessage(message: Message): boolean {
-  return message.role === 'user'
 }
 
 /** Assert the token-meter surface and the live session surface are identical. */
@@ -77,33 +72,29 @@ function assertSurfaceMatchesMeasurement(session: Session, nodes: readonly Token
   }
 }
 
-/** True when a surface node is a tool result (never a legal tail start). */
+/**
+ * True when a surface node is a tool result (never a legal tail start).
+ *
+ * A tool result is now a first-class `tool`-role message carried by a
+ * `tool/result` event, not a block embedded in a user message, so the event type
+ * is the whole test.
+ */
 function isToolResultNode(session: Session, seq: number): boolean {
-  const event = session.events[seq]
+  const event = session.eventAt(SessionSeq(seq))
   if (!event || event.seq !== seq) return false
-  if (event.type === 'tool/result') return true
-  if (event.type === 'user/message') {
-    const data = event.data as { content?: readonly ContentBlock[]; message?: { content?: readonly ContentBlock[] } }
-    const content = data.message?.content ?? data.content
-    return Array.isArray(content) && content.some((block) => block.type === 'tool-result')
-  }
-  return false
+  return event.type === 'tool/result'
 }
 
-/** Index of the first surface node that may be folded (stable prefix end). */
-function pinnedPrefixEnd(
-  messages: readonly Message[],
-  nodes: readonly TokenSurfaceNode[],
-  config: ResolvedCacheAwareConfig,
-  spec: CacheAwareCompactSpec,
-  meter: { estimateMessage(message: Message): number },
-): number {
-  let head = 0
-  if (messages.length > 0 && isUserMessage(messages[0]!) && !isCompactionSummaryMessage(messages[0]!)) {
-    const cost = estimateMessageTokens(messages[0]!, meter)
-    const budget = Math.min(config.maxPinnedFirstUserTokens, Math.floor(spec.contextWindow * config.pinnedFirstUserWindowFrac))
-    if (cost <= budget) head = 1
-  }
+/**
+ * Index of the first surface node that may be folded (stable prefix end).
+ *
+ * Upstream `pinnedPrefixLen` keeps only the system message, so the analogue is
+ * `messages[0].role === 'system'` — the system prompt is derived history in the
+ * current session format (surface node 0). Everything after it, including the
+ * first user turn, is foldable.
+ */
+function pinnedPrefixEnd(messages: readonly Message[], nodes: readonly TokenSurfaceNode[]): number {
+  const head = messages.length > 0 && messages[0]!.role === 'system' ? 1 : 0
   // Keep index alignment with nodes; nodes and messages are both surface-ordered.
   return Math.min(head, nodes.length)
 }
@@ -126,7 +117,7 @@ export function selectReasonixRange(
   assertSurfaceMatchesMeasurement(session, nodes)
   if (nodes.length === 0 || messages.length === 0) return null
 
-  const head = pinnedPrefixEnd(messages, nodes, config, spec, meter)
+  const head = pinnedPrefixEnd(messages, nodes)
   if (head >= nodes.length) return null
 
   let tailTokens = spec.recentTailTokens
@@ -147,16 +138,7 @@ export function selectReasonixRange(
     startIdx--
   }
 
-  // Preserve protected messages ([[keep]] user turns, error tool results) by
-  // moving the fold boundary before the earliest protected message in the fold.
-  for (let i = head; i < startIdx; i++) {
-    if (isProtectedMessage(messages[i]!)) {
-      startIdx = i
-      break
-    }
-  }
-  // Re-align after protected-message moves (a protected error tool result must
-  // not become an orphan at the tail start).
+  // Re-align after boundary moves (a tool result must not orphan at the tail start).
   while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
     startIdx--
   }
@@ -174,7 +156,8 @@ export function selectReasonixRange(
     startIdx: head,
     endIdx,
     shadowedSeqs: shadowed.map((n) => n.seq),
-    shadowedTokenCount: shadowed.reduce((sum, n) => sum + n.tokens, 0),
+    shadowedTokenCount: shadowed.reduce((sum, n) => sum + n.heuristicTokens, 0),
+    shadowedRouteTokenCount: shadowed.reduce((sum, n) => sum + n.tokens, 0),
   }
 }
 
@@ -197,13 +180,7 @@ export function selectOverflowRange(
   while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
     startIdx--
   }
-  for (let i = head; i < startIdx; i++) {
-    if (isProtectedMessage(messages[i]!)) {
-      startIdx = i
-      break
-    }
-  }
-  // Re-align after protected-message moves.
+  // Re-align after boundary moves.
   while (startIdx > head && startIdx < nodes.length && isToolResultNode(session, nodes[startIdx]!.seq)) {
     startIdx--
   }
@@ -218,7 +195,8 @@ export function selectOverflowRange(
     startIdx: head,
     endIdx: startIdx - 1,
     shadowedSeqs: shadowed.map((n) => n.seq),
-    shadowedTokenCount: shadowed.reduce((sum, n) => sum + n.tokens, 0),
+    shadowedTokenCount: shadowed.reduce((sum, n) => sum + n.heuristicTokens, 0),
+    shadowedRouteTokenCount: shadowed.reduce((sum, n) => sum + n.tokens, 0),
   }
 }
 
@@ -242,47 +220,26 @@ export function fixedPrefixTokens(measurement: TokenMeasurement, startIdx: numbe
 }
 
 /**
- * Reasonix `acceptCheckpointCandidate`: normal path requires candidate ≤ 50%
- * and below trigger; force/overflow may exceed the ceiling only when still
- * below trigger; manual below trigger accepts any real savings.
+ * Reasonix `acceptCheckpointCandidate` at the synced upstream commit.
+ *
+ * Upstream requires real savings and, for automatic maintenance, a result below
+ * the physical input ceiling (`window - outputTokens - protocolReserveTokens`). The former
+ * normal-path 50% checkpoint ceiling, the trigger comparison, and the
+ * exceptional fixed-prefix savings path no longer exist upstream: any strictly
+ * smaller candidate is accepted, and a manual checkpoint may land above the
+ * physical ceiling because it is an explicit rescue.
  */
 export function acceptCheckpointCandidate(opts: {
   trigger: string
-  force: boolean
   sourceTokens: number
   candidateTokens: number
-  fixedPrefixTokens: number
   spec: CacheAwareCompactSpec
-  config: ResolvedCacheAwareConfig
 }): void {
-  const { trigger, force, sourceTokens, candidateTokens, fixedPrefixTokens, spec, config } = opts
+  const { trigger, sourceTokens, candidateTokens, spec } = opts
   if (candidateTokens >= sourceTokens) {
     throw new Error(`checkpoint rejected: candidate would not reduce tokens (${candidateTokens} >= ${sourceTokens})`)
   }
-  const manualBelowTrigger = trigger === 'manual' && sourceTokens < spec.thresholdTokens
-  if (manualBelowTrigger) return
-
-  if (fixedPrefixTokens > spec.ceilingTokens) {
-    const savings = sourceTokens - candidateTokens
-    if (savings < spec.exceptionalMinSavingsTokens) {
-      throw new Error(`checkpoint rejected: fixed-prefix exception requires >=${spec.exceptionalMinSavingsTokens} token savings, got ${savings}`)
-    }
-    if (candidateTokens >= spec.thresholdTokens) {
-      throw new Error(`checkpoint rejected: candidate ${candidateTokens} still at or above trigger ${spec.thresholdTokens}`)
-    }
-    if (candidateTokens >= spec.hardCeilingTokens) {
-      throw new Error(`checkpoint rejected: candidate ${candidateTokens} still at or above physical ceiling ${spec.hardCeilingTokens}`)
-    }
-    return
-  }
-
-  if (candidateTokens > spec.ceilingTokens && !force) {
-    throw new Error(`checkpoint rejected: candidate ${candidateTokens} exceeds checkpoint ceiling ${spec.ceilingTokens}`)
-  }
-  if (candidateTokens >= spec.thresholdTokens && !force) {
-    throw new Error(`checkpoint rejected: candidate ${candidateTokens} still at or above trigger ${spec.thresholdTokens}`)
-  }
-  if (force && candidateTokens >= spec.thresholdTokens) {
-    throw new Error(`checkpoint rejected: forced candidate ${candidateTokens} still at or above trigger ${spec.thresholdTokens}`)
+  if (trigger !== 'manual' && spec.hardCeilingTokens > 0 && candidateTokens >= spec.hardCeilingTokens) {
+    throw new Error(`checkpoint rejected: candidate ${candidateTokens} still at or above physical ceiling ${spec.hardCeilingTokens}`)
   }
 }

@@ -4,6 +4,9 @@
 > capabilities supplied by configuration and plugins**. This document is the
 > contract — code follows it. Change the contract first, then the code.
 
+The current file-operation, scheduling, and interruption contract is specified
+in [Harness-style execution migration](DSH_EXECUTION_MIGRATION.md).
+
 ## 1. Design Principles
 
 1. **Config- and plugin-driven core.** The core knows only interfaces. Concrete
@@ -57,7 +60,8 @@ self-register; parents never import children. The Remote-SSH module layers
 `cli → remote/bootstrap → remote → {remote/forward, remote/sftpfs, config,
 netclient}`; `remote` and its subpackages never import `cli`, `agent`, or
 `serve`, and all interactivity flows through callbacks (host-key / secret
-prompts) so the desktop module consumes the same surface. See §Remote below.
+prompts) so the desktop module consumes the same surface. See the
+[Remote sessions](./REMOTE_SESSIONS.md) guide.
 
 ## 3. Core Abstractions
 
@@ -130,20 +134,24 @@ type Tool interface {
 ### 3.3 Plugins (`internal/plugin`) — MCP client
 
 An external plugin is an MCP server declared in config. The wire protocol is
-**JSON-RPC 2.0** in every case; only the transport differs. A `transport`
-interface (`call` / `notify` / `close`) abstracts that, so the MCP-level logic
-(handshake, `tools/list`, `tools/call`, …) is written once.
+**JSON-RPC 2.0** in every case; only the transport differs. Reasonix keeps the
+product-level client and delegates protocol negotiation, request correlation,
+cancellation, pagination, and transport framing to the official MCP Go SDK.
+One concurrency-safe session per configured server is shared by tools, prompts,
+and resources.
 
 - **Transports** (config `type`):
   - `stdio` (default) — a local subprocess; one JSON message per line over the
     child's stdin/stdout (the MCP stdio convention). Declared with
     `command` / `args` / `env`; terminated on ctx cancel / shutdown.
-  - `http` (a.k.a. `streamable-http`) — a remote server at `url`. Each request
-    is an HTTP POST; the server replies with either `application/json` (one
-    response) or `text/event-stream` (an SSE stream carrying the response plus
-    any server notifications). The `Mcp-Session-Id` response header, once seen,
-    is echoed on subsequent requests. Static `headers` (e.g. a bearer token) are
-    sent on every request. When no static `Authorization` header is configured,
+  - `http` (a.k.a. `streamable-http`) — a remote server at `url`. After
+    initialize, a long-lived GET/SSE listener receives server messages while
+    POST carries client requests; POST-only and sessionless servers remain
+    supported. The `Mcp-Session-Id` response header, once seen, is echoed on
+    subsequent GET, POST, and bounded shutdown DELETE requests. Static
+    `headers` (e.g. a bearer token) are sent to the configured origin on each
+    transport method and are never forwarded cross-origin. When no static
+    `Authorization` header is configured,
     user-initiated OAuth uses Protected Resource Metadata and Authorization
     Server Metadata discovery, dynamic client registration, PKCE S256, a
     loopback callback, resource indicators, and refresh-token rotation. Client
@@ -161,6 +169,13 @@ interface (`call` / `notify` / `close`) abstracts that, so the MCP-level logic
   and `headers` so secrets come from the environment, not the config file.
 - Lifecycle: `initialize` → `notifications/initialized` → `tools/list`;
   invocation via `tools/call {name, arguments}`.
+- A per-server supervisor publishes only fully initialized/listening sessions.
+  An established session that returns 404 is rebuilt once with concurrent
+  callers joining the same rebuild; a call is replayed at most once. Ambiguous
+  disconnects never replay tool calls because the server may already have
+  executed them. Terminal background disconnects use bounded reconnect delays,
+  and stale callbacks from an older session generation cannot replace current
+  state.
 - When a workspace root exists, initialize advertises `roots` and transports
   answer `roots/list` with its file URI. `tools/call` includes a per-call
   `_meta.progressToken`; matching `notifications/progress` messages stream into
@@ -191,7 +206,10 @@ interface (`call` / `notify` / `close`) abstracts that, so the MCP-level logic
   process sandbox remain host-controlled boundaries.
 - `prompts/list` + `prompts/get` surface as `/mcp__<server>__<prompt>` slash
   commands; `resources/list` + `resources/read` are referenced as
-  `@<server>:<uri>` in chat. `/mcp` shows connected servers and their counts.
+  `@<server>:<uri>` in chat. All list cursors are consumed while preserving
+  server order. `/mcp` shows connected servers, counts, protocol/listening state,
+  reconnect attempts, and a redacted error category; it never exposes a session
+  identifier.
 - `cmd/reasonix-plugin-example` is a runnable reference stdio server (`echo`,
   `wordcount`), driven by an end-to-end test that builds the real binary.
 
@@ -207,32 +225,33 @@ interface (`call` / `notify` / `close`) abstracts that, so the MCP-level logic
 
 ### 3.5 Two-model collaboration (`Coordinator`)
 
-When `agent.planner_model` names a provider different from the executor, a
-`Coordinator` runs two models in **separate sessions** to keep each one's prompt
-prefix cache-stable:
+When `agent.planner_model` is set, a `Coordinator` runs two models in
+**separate sessions** to keep each one's prompt prefix cache-stable. An empty
+`planner_model` leaves the session executor-only. A configured but unusable
+planner model is a configuration error and does not silently continue on the
+executor:
 
 - The **planner** (low-frequency) runs in its own session with the same standing
   memory context plus a filtered read-only research tool set, then produces a
-  concise plan. A deterministic host policy chooses executor-only, light
-  planning, full planning, plan-for-approval, or explicit plan-only from
-  pristine user text plus trusted turn metadata. It does not call a classifier
-  model and does not infer host state from controller-authored prompt blocks.
-  Explicit Plan Mode, synthetic turns, short contextual replies, atomic edits,
-  and bounded read-only actions avoid a second planner; cross-surface,
-  structured, ambiguous, and high-risk work uses the full contract. Active Goal
-  and Delivery turns upgrade non-atomic mutation work, while bounded read-only
-  actions remain executor-only. The privacy-safe
-  route/depth/reason decision is emitted in phase detail.
-- Light plans use a small per-turn research-round budget and return a compact
-  objective, 1-4 ordered steps, likely touchpoints, and primary verification.
-  Full plans use a larger bounded budget and distinguish verified from candidate
-  touchpoints, with risks, acceptance criteria, command-level verification, and
-  rollback when relevant. The depth contract stays in one stable system prompt;
-  only a small host-authored `<planner-turn>` block changes per user turn. If
-  the planner still does not finalize after the bounded research and grace
-  round, plan-and-execute falls back to the executor with the pristine task;
-  plan-only and plan-for-approval remain fail-closed. The incomplete planner
-  turn is rolled back rather than exposed as a broken manual continuation.
+  concise plan. A deterministic host policy defaults to executor-only. It
+  invokes the dedicated planner only for an explicit plan-first /
+  plan-then-execute request, an explicit wait-for-approval boundary, an
+  explicit plan-only request, or an explicit Goal start. It does not call a
+  classifier model, does not infer complexity from wording, file count, or
+  keywords, and does not infer host state from controller-authored prompt
+  blocks. Explicit Plan Mode is an executor-driven workflow and never starts a
+  second planner. Synthetic turns, short contextual replies, and ordinary
+  requests stay executor-only. There is no Light/Full planning depth. The
+  privacy-safe route/reason decision is emitted in phase detail.
+- The planner uses one stable system prompt. Only a small host-authored
+  `<planner-turn>` block names the explicit route. The plan distinguishes
+  verified from candidate touchpoints and records non-goals, risks, acceptance
+  criteria, and command-level verification when the evidence supports them.
+  `submit_plan` is the only delivery channel; a prose reply without a submitted
+  plan is a planner protocol error. If the planner still does not finalize after
+  the bounded research and grace round, every route fails closed and the
+  executor is not started. The incomplete planner turn is rolled back rather
+  than exposed as a broken manual continuation.
 - A bare plan-first route hands the completed plan directly to the executor.
   Plan-for-approval is reserved for an explicit request to wait for
   confirmation; the host enforces that boundary even if the planner omits its
@@ -256,19 +275,42 @@ canonical transcript and installs a short **provider-visible checkpoint** only
 when the sole automatic threshold is crossed.
 
 - Each provider declares `context_window` (tokens). The only automatic trigger is
-  `agent.compact_ratio` (default **0.85**; presets 0.70 / 0.80 / 0.85; range
-  0.65–0.85).
+  `agent.compact_ratio` (default **0.80**; presets 0.70 / 0.80 / 0.85; range
+  0.30–0.85). Lower values compact sooner and may increase summary cost or
+  reduce prompt-cache reuse.
   `triggerTokens = floor(context_window × compact_ratio)`.
-- **Below the trigger** history is never rewritten: no summary, no prune/snip
-  projection, no sidecar write, no projection-version bump, no maintenance event.
-  Any rewrite would invalidate the prompt cache from that point on.
-- **At the trigger** Reasonix runs **one** summary transaction:
-  `stable prefix + one structured digest + recent verbatim tail`.
-  Acceptance (normal path): candidate ≤ 50% of the window, strictly smaller than
-  the source, and below `triggerTokens`. Candidates are **not** padded toward 50%.
-  Typical landings are about 10%–30% of the window.
-  Internal construction budgets (not user settings):
-  `recentTailBudget = clamp(window×10%, 32K, 96K)`, summary output max **16K**.
+- **Below the trigger** ordinary requests remain append-only and no sidecar is
+  written. Every provider request uses the durable, bounded tool `Content`;
+  local `RawContent` is never promoted into sampling, retry, summary, or replay.
+- **At the trigger** one singleflight maintenance transaction first persistently
+  prunes every tool result over 8192 Unicode code points to `4096 head +
+  "[... tool result middle pruned ...]" + 1024 tail`. If this clears pressure,
+  no summary request is made. Otherwise Reasonix summarizes the old contiguous
+  prefix and retains the newest **16%** of the context window verbatim, aligned so
+  assistant tool calls and tool results are never split.
+- The summary request replays the original system message, the selected message
+  prefix, and the ordinary request's tool schemas, then appends one final user
+  compaction instruction. This shape can reuse provider KV cache. Output is capped
+  at **8192 tokens**, and prefix planning keeps **5%** of the window (at least 256
+  tokens) below that cap as estimator headroom. A pressure run may make one
+  additional convergence summary (at most two successful summaries total);
+  overflow makes at most one summary and retries the original request at most
+  once after projection-version progress. An overflow rescue may also fold the
+  active turn's completed rounds, keeping its newest two rounds verbatim.
+- Every summary reply, success or provider overflow, feeds its real prompt count
+  back into the estimator. When the provider rejects the summary request itself,
+  the fold is re-planned on the corrected estimate (at most twice), then sent once
+  as a bounded transcript (tool results cut to 2000 characters, no tool schemas);
+  a manual compact may then take the fragment path. A failed automatic attempt
+  backs off further attempts on the same turn until the view has grown by 5% of
+  the window since that attempt, which bounds the retries one turn can pay.
+- A checkpoint must be strictly smaller than the replaced full request. Summary
+  timeout/error/empty/max-token results never produce a mechanical digest. Below
+  the hard ceiling the latest durable projection continues. At overflow or the
+  hard ceiling, when no summary can form, a lossy `truncate` projection elides the
+  oldest tool results and then drops the oldest replay units behind an explicit
+  marker until the view fits under the trigger; `ErrCompactionRequired` is
+  returned only when even that cannot reclaim enough.
 - Users inspect or change the threshold with
   `reasonix config compact-ratio [--local] [VALUE]`. Project config overrides the
   user-global value used by desktop and new CLI sessions. UI always shows the
@@ -289,11 +331,12 @@ when the sole automatic threshold is crossed.
     the physical remainder. A negative value force-omits optional wire limits;
     if the known auto budget no longer fits, Reasonix compacts instead of
     overriding that choice.
-- Giant tool results are bounded **once**, on first entry to the model:
-  `Content` is the stable ≤32KB visible form; `RawContent` holds the full original
-  only when they differ. Maintenance never rewrites old tool bodies.
-  `ModelMessages` strips `RawContent` so provider serialization and cache hashes
-  never include it.
+- Canonical tool storage remains backward compatible: `Content` is the stable
+  provider-visible ≤32KB form and `RawContent` holds the full local original.
+  Full results are returned to the model only after an explicit paged
+  `use_capability` call to `session:tool_result`; sampling, stream retry, summary,
+  and projection replay all use the same bounded `Content`. Prune projections
+  never rewrite either canonical field. Older supported readers remain bounded.
 - Automatic maintenance is planned once in `ContextManager.Prepare` from the
   current projection plus the append-only canonical tail. The canonical
   transcript is never rewritten. Subsequent thresholds merge
@@ -305,9 +348,10 @@ when the sole automatic threshold is crossed.
   `compact_force_ratio`, `cold_resume_prune`, `context_editing`) are removed on
   ordinary start and ignored at runtime. Native provider tool clearing is not
   used; every provider uses the local summary checkpoint path.
-- Keep policy (`keep` / `recent_keep`) and the active tool turn remain protected
-  content. Restart restores an existing checkpoint without re-summarizing or
-  replaying timeline cards.
+- `keep` / `recent_keep` remain readable and round-trip for compatibility but are
+  deprecated and ignored by compaction. Old user turns, failed tool results, and
+  `[[keep]]` messages enter the summary prefix. Restart restores an existing
+  checkpoint without re-summarizing or replaying timeline cards.
 - Full history remains in the session transcript. The read-only `history` tool
   provides BM25 retrieval over sessions; new summary checkpoints do not create
   prune archives.
@@ -333,14 +377,12 @@ when the sole automatic threshold is crossed.
   budgets. This never mutates the stable system prompt or tool schemas.
 - The owning controller may auto-allow only a bounded, non-sensitive,
   create-only project/reference `remember`, including in a top-level headless
-  run. In Ask, global facts, preferences, feedback, updates, duplicates,
-  sensitive/oversized content, and every `forget` require a fresh human
-  approval. Interactive Auto treats `remember` and `forget` as normal policy
-  fallback while preserving explicit `ask` and `deny` rules. Interactive YOLO
-  bypasses memory ask prompts unless an explicit deny rule matches.
+  run. Other memory writes follow the active permission preset and preserve
+  explicit `ask` and `deny` rules. Full access bypasses ordinary prompts unless
+  an explicit deny rule matches.
   Guardian/safety review cannot answer these prompts on the user's
   behalf. Sub-agents and headless surfaces without the owning scoped
-  controller fail closed, including headless YOLO except for the create-only
+  controller fail closed, including headless execution except for the create-only
   path above. The approval request includes a compact preview, while
   external notification hooks only receive the tool name.
 - Facts carry immutable IDs, monotonic revisions, timestamps, type, and scope.
@@ -350,52 +392,19 @@ when the sole automatic threshold is crossed.
   See [`SESSION_MEMORY_RETRIEVAL.md`](SESSION_MEMORY_RETRIEVAL.md) for the
   detailed implementation contract.
 
-**What survives a fold.** Verbatim, at every compaction: the system prompt, the
-first user turn when it is small enough to be a brief, **every user turn in the
-fold region that fits the retention budget**, and the recent tail. The messages
-the keep policy protects also survive, though a failure with a recorded execution
-keeps only its failure-carrying lines. Everything else is **best-effort** — it
-reaches the summarizer and survives only as well as the digest captured it.
+**What survives a fold.** The system prompt and newest 16% tail survive verbatim.
+Every older model-visible message forms one contiguous summary prefix, including
+user turns, failed tool results, prior digests, and `[[keep]]` messages. Exact
+older wording remains available in the canonical transcript and through the
+read-only `history` tool. `keep` and `recent_keep` are compatibility-only fields.
 
-That protection has to hold across *repeated* folds, which is why a stored
-projection keeps the host's `ToolExecution` record while a provider request does
-not. `KeepErrors` classifies a failure from that record rather than from text,
-because a real `go test` log opens with `=== RUN` and no prefix match can see
-it; a projection written without the record would leave the *next* fold unable
-to classify what the current one just protected. The strip therefore belongs at
-the provider boundary — `ModelMessages` — and not at projection write time,
-where `ProjectionMessages` preserves it.
+Subsequent folds merge the current digest with newer old history into one digest.
+Compaction only writes a projection: canonical storage keeps every original, so
+a missed detail stays recoverable through `history`.
 
-User turns are held to a different standard than the work they govern. A
-constraint stated at turn 4 ("do not change the public API") exists nowhere but
-the transcript, while the code it constrains stays re-derivable from the
-workspace — so the asymmetry of loss, not the token count, decides. Retention is
-bounded rather than unconditional, because hoisting user turns without a budget
-is what padded an earlier revision's candidates past the acceptance ceiling,
-failing compaction outright instead of degrading it. One turn may spend up to
-1500 tokens and all of them together `min(8192, window×5%)`, oldest first — the
-recent tail already covers the newest turns, and an old turn has survived more
-folds than a new one. Unlike the keep policy this is not scoped to the latest
-digest, so a constraint keeps its protection across repeated compaction.
-
-A turn past those bounds folds like any other content. Prefix it with `[[keep]]`
-(keep policy `user_marked`, on by default) to hold it verbatim regardless of
-size. That drop is never silent: compaction telemetry carries `user_kept` and
-`user_dropped` counts, and a committed checkpoint that had to fold one of your
-turns emits a warning naming `[[keep]]` — the projection reads as complete
-either way, so the count is the only thing that distinguishes them.
-
-Two properties bound that loss. Each fold re-derives its digest from the
-canonical transcript rather than from the previous digest, so digests do not
-chain and repeated compaction does not compound summarizer drift. And compaction
-only ever writes a projection: the canonical transcript keeps every original, so
-a folded detail stays recoverable through the `history` tool and the archive
-(`reasonix/archive/<timestamp>.jsonl`) even when the digest missed it.
-
-This is the **only** point where the prompt prefix changes — a deliberate, rare
-"cache-reset point". Between compactions the session grows prepend-only and
-stays cache-friendly, so cache hit rate (the key observability signal) stays
-high. `context_window = 0` disables compaction for an instance.
+Prune and summary commits are deliberate cache-reset points. Between maintenance
+runs the session remains append-only and cache-friendly. `context_window = 0`
+disables automatic compaction for an instance.
 
 ### 3.7 Permissions (`internal/permission`) — per-call gating
 
@@ -432,41 +441,20 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   known keys — `command` (bash), `path` / `file_path` (file tools), `pattern`
   (grep/glob) — so tools need not change. A rule whose subject the args don't
   expose only matches in its bare `Tool` form.
-- **Dynamic Bash.** Parameter/arithmetic expansions, assignments, heredocs, unproved
-  redirects, and shell globs cannot reuse bare Bash, prefix, or glob allows;
-  remembered approvals are exact `Bash=<literal>` rules. They still follow the
-  normal posture fallback, so Auto and an approved-plan window may execute them
-  without prompting. Nested or indirect execution is stricter: command and
-  process substitution, a dynamic command name, parse failures, `eval`,
-  `source`, shell `-c`, PowerShell/cmd command strings, and runtime inline-code
-  flags require a human in interactive Ask/Auto. Guardian, allowing hooks, and
-  the approved-plan window cannot answer that decision; only an identical exact
-  grant or YOLO can bypass it by default. The advanced
-  `[permissions] allow_dynamic_bash = true` opt-in lets an Allow fallback,
-  including Auto, cover this class; explicit `ask` and `deny` rules retain
-  precedence.
+- **Shell syntax.** Pipes, substitutions, redirects, shell `-c`, and runtime
+  inline-code flags follow the active permission preset and OS sandbox. Syntax
+  never creates a separate approval rule. Explicit `deny` rules and exact
+  session grants continue to match the canonical command subject.
 - **Precedence.** `deny` > `ask` > `allow` > fallback. Fallback is `Allow` for
   read-only tools and `Mode` (default `Ask`) for writers. `deny` always wins, so
   a broad `allow = ["Bash"]` can still be carved by `deny = ["Bash(rm -rf*)"]`;
   conversely `ask` overrides a broad `allow` to force a prompt on a risky subset.
-- **Resolving `Ask`.** The interactive front-end (the chat TUI) prompts the user
-  — allow once / allow this approval scope for the session / always allow this
-  approval scope / deny — via an `Approver`. For Bash, the default scope is the
-  concrete command subject, and the user may choose a conservative command-prefix
-  scope when available (for example `Bash(go test:*)`) so similar invocations in
-  the same session or saved config do not prompt again. For file-mutation tools,
-  a session grant covers editing for the rest of the session while a persisted
-  grant is path-scoped when a path is available, stored as `Edit(<path>)` so all
-  built-in file-mutating tools share it. A
-  non-interactive run
-  (`reasonix run`, a sub-agent, anything with no TTY / no approver) cannot prompt.
-  Its explicit posture therefore resolves without blocking: Ask/manual fails
-  closed, Auto allows only ordinary writer fallback, and YOLO may bypass ordinary
-  Ask decisions. Nested or indirect Bash remains stricter: headless
-  Ask/Auto/DontAsk reject it unless an identical literal grant exists; YOLO or
-  `allow_dynamic_bash = true` with an Allow fallback may opt out. A `Deny` is a
-  hard block in *every* mode: the tool never executes and the model receives a
-  "blocked" result it can adapt to (the same shape as a plan-mode refusal).
+- **Resolving authorization.** The interactive frontend offers allow once,
+  allow the displayed scope for this session, or deny. Session grants bind an
+  exact command, canonical directory, or server capability and are never written
+  to project configuration. A non-interactive run cannot prompt and therefore
+  fails closed when its preset does not cover the operation. A `Deny` is a hard
+  block in every preset.
 - **MCP authorization.** Installing an MCP server authorizes all of its tools;
   there is no second server, raw-tool, writer, or destructive approval policy.
   Project configuration is trusted the same way and requires no separate launch
@@ -486,15 +474,14 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   identity; a same-name client on a shared Host is never sufficient authority.
 - **Relationship to plan mode.** Plan mode (§3.4) is a plan-first collaboration
   workflow, not an all-tools read-only mode. Before Permissions/Sandbox, the
-  host enforces explicit phase opt-outs (`complete_step` is read-only but
-  belongs to the post-approval execution phase, so it self-reports plan-unsafe
-  and is refused). The dedicated two-model Planner may call authorized,
+  host enforces explicit phase opt-outs. The dedicated two-model Planner may call authorized,
   non-destructive MCP even when `readOnlyHint` is absent; it hard-blocks
   destructive targets and readers from unauthorized servers for the entire
   planning phase. A single-model Plan without the dedicated Planner continues
   to block MCP writer/destructive targets while Plan is active.
-  Ordinary built-in and Bash calls then use the same Ask/Auto/YOLO, explicit
-  `ask`/`deny`, and Sandbox path as Standard mode. A third-party MCP
+  Ordinary built-in and Bash calls then use the same Read only, Workspace
+  access, or Full access preset, explicit `ask`/`deny`, and OS sandbox path as
+  Standard mode. A third-party MCP
   `readOnlyHint` affects dispatch classification and strict-child eligibility,
   but not the dedicated Planner's non-destructive trust path. Once the server is
   installed or declared in project configuration, all non-destructive
@@ -506,19 +493,13 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   writer-capable `task` and skill execution remain permission-gated instead of
   Plan-blocked, and their child turns inherit the Plan workflow marker and
   explicit phase opt-outs.
-- **User decisions are separate from tool approvals.** Runtime tool approval has
-  three user-facing postures: `ask` ("需要批准"), `auto` ("自动批准"), and
-  `yolo` ("Yolo批准"). `auto` lets the permission policy auto-approve the writer
-  and interactive memory fallback while preserving explicit ask/deny rules;
-  `yolo` skips ordinary tool permission prompts for approval-gated tools such
-  as writers, Bash, and explicit interactive `remember`/`forget` ask prompts.
-  Explicit deny rules and forced fresh reviews
-  for plans, sandbox escapes, and managed config writes still apply. Nested or indirect Bash
-  commands require a human in interactive Ask/Auto even during the approved-plan
-  window; ordinary expansions, assignments, redirects, and globs continue under
-  Auto fallback but cannot inherit reusable Bash rules. YOLO is the sole mode
-  bypass for the human-required class, while an identical exact literal remains
-  an ordinary explicit authorization.
+- **User decisions are separate from tool approvals.** Runtime permission has
+  three presets: `read-only`, `workspace-write`, and `danger-full-access`.
+  Workspace write is the default and confines local mutations to the workspace
+  and private session temporary directory. Full access skips ordinary prompts
+  and Reasonix filesystem/network confinement. Explicit host deny rules still
+  run before launch, but Reasonix does not constrain the launched process.
+  Shell syntax does not alter the selected preset.
   Neither posture answers `ask` questions or approves `exit_plan_mode` plans.
   Plan Mode is entered only through an explicit user choice and remains
   independent of the active tool-approval posture. After a user approves a
@@ -531,12 +512,14 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
 - **Collaboration mode is separate from tool approval.** The desktop composer
   presents collaboration as `normal` ("正常模式"), `plan` ("计划模式"), and
   `goal` ("目标模式"). `/goal <objective>` starts an autonomous, session-scoped
-  active goal: the controller prepends goal context to user turns outside the
-  cache-stable system prompt and keeps issuing continuation turns until the
-  model reports completion, repeats the same blocked state three times, the user
-  stops it, or the safety continuation limit is reached. Blocked-state matching
-  is normalized for casing, whitespace, and punctuation so minor wording drift
-  does not reset the audit; restarting a goal begins a fresh blocked audit. A
+  active goal: stable lifecycle-tool rules stay in the cacheable system prefix,
+  while each automatic round carries the escaped objective and exact goal
+  identity as dynamic user input. A runtime-idle driver admits one normal
+  top-level turn at a time until the model completes or blocks the goal, the
+  user pauses or clears it, or an explicit resource boundary is reached. An
+  automatic blocked transition is rejected before three admitted goal rounds;
+  deciding whether the same blocker persisted is the model's responsibility,
+  not a second host detector. A
   goal is treated as a task contract: if the objective includes Context,
   Request, Output format, Constraints, or Pause policy sections, those sections
   define the autonomous work boundary. When they are absent, the model infers a
@@ -548,15 +531,17 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   constraints, and relevant verification expectations to be satisfied or
   explicitly reported as unverified.
   Goal has no default model-round, cross-Run turn, wall-clock, or numeric
-  no-progress boundary. Goal-scoped novelty accepts new read/search results and state changes
-  but rejects exact tool/argument/result repeats. All classes use the same Goal
-  FSM, host receipts, Delivery readiness, and bounded evaluator; there is no second research
-  protocol or writable sidecar runtime. Legacy `.reasonix/autoresearch/...`
+  no-progress boundary. Exact consecutive tool calls receive bounded reminders
+  and still execute. The model-facing lifecycle is `get_goal`, `create_goal`
+  and versioned `update_goal(edit|pause|resume|complete|blocked)`. There is no
+  `continue` action: `active + armed` is sufficient for the idle driver. There
+  is no host readiness evaluator, second research protocol or writable sidecar
+  runtime. Legacy `.reasonix/autoresearch/...`
   archives remain read-only and explicit old paths recover as ordinary Goals.
-  Outside goal mode, ordinary prompts never change collaboration mode; the user
-  must choose Goal or use `/goal` explicitly.
-  Repeated host failures, zero-evidence rounds, and Todo stalls trigger bounded
-  strategy redirects and intervention-epoch resets, never a Goal pause. Turns,
+  Ordinary prompts never force collaboration mode at the host level, although
+  the model may create a long-running goal from a directly authorized human
+  request when its semantics require autonomous continuation.
+  Turns,
   tokens, provider requests, and active work duration remain observational when
   the corresponding budget is not configured. Positive user-selected
   `[agent].goal_token_budget`, `max_steps`, time, and cost budgets remain
@@ -568,19 +553,19 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   the active goal in the desktop UI so the collaboration mode remains one of
   the three choices, while the underlying tool approval posture is preserved.
 
-| Tool approval posture | Tool approvals | Plan approval | `ask` questions |
+| Permission preset | Tool authorization | Plan approval | `ask` questions |
 | --- | --- | --- | --- |
-| Need approval / `ask` | Follow permission policy (`Ask` prompts interactively) | Waits for user | Waits for user |
-| Auto approve / `auto` | Writer fallback and interactive `remember`/`forget` fallback auto-allowed; explicit ask/deny rules still apply | Waits for user | Waits for user |
-| YOLO approval / `yolo` | Ordinary prompts auto-allowed, including `remember`/`forget`; deny rules and plan/sandbox/config reviews remain | Waits for user | Waits for user |
-| Approved-plan execution window | Approved plan's writer fallback is auto-allowed; explicit `ask` / `deny` rules remain | Future plans still wait | Waits for user |
+| Read only / `read-only` | Reads are allowed; writes and external side effects require a scoped authorization | Waits for user | Waits for user |
+| Workspace access / `workspace-write` | Workspace and private session temp writes run inside the OS sandbox; boundary crossings require authorization | Waits for user | Waits for user |
+| Full access / `danger-full-access` | Ordinary prompts and Reasonix process sandboxing are skipped; explicit host deny rules still run before launch | Waits for user | Waits for user |
+| Approved-plan execution window | The approved plan may execute only within the active preset; explicit `ask` / `deny` rules remain | Future plans still wait | Waits for user |
 
-Out of the box (`mode = "ask"`, no rules), interactive `reasonix` prompts before
-each writer/bash call and `reasonix run` fails closed on those calls because it
-has no approver. Use `reasonix run --auto ...` / `-y` to allow ordinary writer
-fallback in unattended automation; `--permission-mode auto` is equivalent.
-Explicit `ask` rules still fail closed under Auto, and `deny` rules harden every
-posture.
+Out of the box, new sessions use `workspace-write`: workspace and private
+session-temp operations run in the OS sandbox without prompting. Use
+`--permission-mode read-only` for inspection-only automation or explicitly
+select `--permission-mode danger-full-access` when unrestricted local access is
+required. Explicit `ask` rules still require authorization, and `deny` rules
+harden every preset.
 
 ### 3.8 Slash commands (`internal/command`)
 
@@ -660,7 +645,8 @@ resolved and prepended to the message as a tagged block the model can read.
 A subagent profile is a Skill with `runAs: subagent` and, for profiles managed
 by the desktop or CLI editors, `invocation: manual`. Profiles reuse the existing
 project/global Skill files; they do not introduce another state format or
-database. Manual invocation excludes a profile from the pinned Skill index so
+database. Manual invocation excludes a profile from the `session-context`
+Skills catalog so
 the model cannot discover it implicitly, while explicit `/<name> <task>`
 invocation remains available.
 
@@ -752,11 +738,14 @@ registry to that claim before the child runs:
 - after the run, the host compares the mutations it recorded against the claim
   and reports any outside path to the parent in the sub-agent's host receipts.
 
-Omitting `write_paths` is not an unscoped writer: the run claims the whole
-workspace and therefore serialises against every other writer claim. That claim
-is a scheduling boundary only — inside the workspace nothing is refused, because
-no concurrent writer can hold an overlapping claim at the same time. Writes that
-leave the workspace are still reported as claim violations.
+Omitting `write_paths` is not an unscoped writer: the run starts by claiming
+the whole workspace, so it cannot start beside another writer. After it has
+only performed path-bound writes, the scheduler reservation shrinks to those
+files and a parent (or sibling) may write elsewhere. A `bash` or MCP workspace
+mutation makes the claim whole-workspace again. Directory claims may start
+together; they serialize only when they realize the same file. Enforcement
+still uses the declared bound — sandbox/`AllowsPath` do not shrink. Writes
+that leave the workspace are still reported as claim violations.
 
 Declaring paths is what buys parallelism; it costs `bash` on hosts where the OS
 sandbox cannot enforce write roots.
@@ -1045,8 +1034,10 @@ kind           = "anthropic"
 base_url       = "https://api.deepseek.com/anthropic"
 # request_url  = "https://proxy.example.com/anthropic/v1/messages" # optional exact provider request URL
 # models_url   = "https://proxy.example.com/v1/models"             # optional model discovery URL
-models         = ["deepseek-v4-flash", "deepseek-v4-pro"]
-default        = "deepseek-v4-flash"   # optional; defaults to models[0]
+models         = ["deepseek-flash", "deepseek-v4-pro"]
+default        = "deepseek-flash"   # optional; defaults to models[0]
+# vision_models = ["deepseek-v4-flash-vision-exp"]  # legacy compatibility; Settings derives image support from model metadata
+# Official DeepSeek vision accepts inline base64, http(s) image URLs, and Files API file_id.
 api_key_env    = "DEEPSEEK_API_KEY"
 web_search     = true
 context_window = 1000000   # tokens; harness compacts older history near this limit (0 disables)
@@ -1055,7 +1046,7 @@ context_window = 1000000   # tokens; harness compacts older history near this li
 # max_output_tokens = 65536          # optional cost cap
 # max_output_tokens = -1             # force-omit optional wire limits; compact if the auto budget no longer fits
 # max_output_tokens never changes compact_ratio
-# model_overrides = { "deepseek-v4-flash" = { context_window = 1000000, max_output_tokens = 32768 } }
+# model_overrides = { "deepseek-flash" = { context_window = 1000000, max_output_tokens = 32768 } }
 
 # A single-model entry still works for custom OpenAI-compatible endpoints.
 
@@ -1232,11 +1223,8 @@ behavior. The escape-prompt and broader OS support are Phase 1's remainder (§9)
 - Sandbox Phase 1: an OS-level jail for `bash` so commands — not just the
   file-writer built-ins (Phase 0) — are confined to the workspace. **Seatbelt on
   macOS and bubblewrap on Linux ship, on by default when available** (see §5).
-  Remaining: the escape-prompt — detect sandbox-unavailable or sandbox-denied failures and
-  offer an explicit, permission-gated unconfined rerun (in `reasonix run`, the
-  command just fails and the model adapts), which completes the "allow inside the
-  box, prompt at its edge" model. With this in place, "always allow" rule
-  persistence becomes optional rather than load-bearing.
+  Restricted presets fail closed when the platform sandbox cannot be established;
+  Reasonix never offers an unconfined retry as a fallback.
 - MCP long tail (deferred deliberately): `headersHelper` auth for remote
   servers; the remaining `.mcp.json` scopes
   (local / user — project scope shipped, see §5); tool-search deferral;
@@ -1244,5 +1232,3 @@ behavior. The escape-prompt and broader OS support are Phase 1's remainder (§9)
   provide *providers*, not just tools.
 - An Anthropic-native provider `kind` (native prompt-cache control), proving the
   registry generalises beyond one wire format.
-- "Always allow" persistence writing learned rules back to project config; a
-  per-session permission override flag for `reasonix run`.

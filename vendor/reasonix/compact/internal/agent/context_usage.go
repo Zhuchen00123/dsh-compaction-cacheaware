@@ -4,9 +4,10 @@ import "reasonix/internal/tool"
 
 // contextUsage memoises the projected prompt size. The estimate walks every
 // visible message, and status gauges redraw far more often than the view moves,
-// so it is keyed on everything that can change the answer: the transcript,
+// so it is keyed on everything that can change the answer: the session, transcript,
 // projection, calibration, and provider-visible tool schemas.
 type contextUsage struct {
+	session            *Session // transcript versions are local to this instance
 	transcriptVersion  uint64
 	projectionVersion  uint64
 	calibration        *promptTokenCalibration
@@ -34,6 +35,7 @@ func (a *Agent) ContextUsedTokens() int {
 	tools := a.svc.tools
 	toolSchemaRevision := tools.SchemaRevision()
 	if cached := a.sess.output.contextUsage.Load(); cached != nil &&
+		cached.session == session &&
 		cached.transcriptVersion == transcriptVersion &&
 		cached.projectionVersion == projectionVersion &&
 		cached.calibration == calibration &&
@@ -43,6 +45,7 @@ func (a *Agent) ContextUsedTokens() int {
 	}
 	tokens := a.estimatedVisibleRequestTokens(a.modelVisibleMessages())
 	a.sess.output.contextUsage.Store(&contextUsage{
+		session:            session,
 		transcriptVersion:  transcriptVersion,
 		projectionVersion:  projectionVersion,
 		calibration:        calibration,

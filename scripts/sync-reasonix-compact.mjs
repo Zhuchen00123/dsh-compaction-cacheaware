@@ -3,14 +3,23 @@
  * Sync the compatible Reasonix compact design into dsh-compaction-cacheaware.
  *
  * The upstream main-v2 branch is allowed to evolve independently. This script
- * only creates a PR when the upstream compact.go still exposes the contract
- * understood by this TypeScript port. A structural upstream rewrite is reported
- * as a warning and intentionally produces no changes; it must be ported and
- * reviewed manually instead of being auto-vendored.
+ * always records where upstream is and refreshes the vendored snapshot, and it
+ * writes a compatibility report describing how far the port has drifted.
+ *
+ * Historically this script treated any structural upstream change as a reason
+ * to produce *nothing*: it printed a warning and exited, so CI opened no pull
+ * request and the vendored snapshot silently rotted for weeks. It now always
+ * lands the snapshot + a report, and only the *generated constant values* fall
+ * back to local policy for constants upstream has removed.
+ *
+ * Usage:
+ *   node scripts/sync-reasonix-compact.mjs
+ *   node scripts/sync-reasonix-compact.mjs --from <dir>     # use a pre-fetched upstream tree
+ *   node scripts/sync-reasonix-compact.mjs --report <path>  # default docs/UPSTREAM_SYNC_REPORT.md
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -21,49 +30,57 @@ const upstreamDir = join(root, '.tmp', 'reasonix-upstream')
 const vendorDir = join(root, 'vendor', 'reasonix', 'compact')
 const generatedFile = join(root, 'src', 'generated', 'reasonix-constants.ts')
 
-const compactFiles = [
-  'internal/agent/compact.go',
-  'internal/agent/compact_fold_input.go',
-  'internal/agent/compact_projection.go',
-  'internal/agent/compact_commit.go',
-  'internal/agent/compact_user_turns.go',
-  'internal/agent/context_manager.go',
-  'internal/agent/context_usage.go',
-  'internal/agent/context_report.go',
-  'internal/agent/context_receipt.go',
-  'internal/agent/context_recovery.go',
-  'internal/agent/context_status.go',
+// Auto-discovery replaces the old hardcoded list: upstream adds compaction
+// source files regularly, and a fixed list silently ignored them.
+const TRACKED_SOURCE_RE = /^internal\/agent\/(?:compact|context)[a-z_]*\.go$/
+const DOC_FILES = [
   'docs/research/cache-aware-compaction-design.md',
   'docs/SPEC.md',
 ]
 
-// These are deliberate local policy values. Upstream may change its defaults,
-// but changing the TS port's trigger/tail policy requires a separate review.
+// Last local value for everything the port consumes. It is the baseline the
+// drift report diffs against, and the fallback used only if upstream removes a
+// constant the port still imports.
+//
+// Constants upstream has already deleted (the checkpoint ceiling, recent-tail
+// min/max, exceptional savings, first-user pinning, kept-user-turn budget — and
+// the `compact_user_turns.go` that carried them) are deliberately absent: the
+// port no longer has the concepts, so tracking them would recreate exactly the
+// dead configuration this list exists to surface.
 const LOCAL_POLICY = Object.freeze({
   REASONIX_DEFAULT_COMPACT_RATIO: 0.85,
-  REASONIX_CHECKPOINT_CEILING_RATIO: 0.5,
   REASONIX_RECENT_TAIL_BUDGET_RATIO: 0.1,
-  REASONIX_MIN_RECENT_TAIL_TOKENS: 8192,
-  REASONIX_MAX_RECENT_TAIL_TOKENS: 16384,
   REASONIX_SUMMARY_OUTPUT_MAX_TOKENS: 16384,
-  REASONIX_EXCEPTIONAL_MIN_SAVINGS_RATIO: 0.25,
   REASONIX_MIN_RECENT_KEEP: 2,
   REASONIX_MIN_COMPACT_MESSAGES: 2,
-  REASONIX_MAX_PINNED_FIRST_USER_TOKENS: 1500,
-  REASONIX_PINNED_FIRST_USER_WINDOW_FRAC: 0.15,
-  REASONIX_MAX_KEPT_USER_TURN_TOKENS: 1500,
-  REASONIX_KEPT_USER_TURNS_BUDGET_TOKENS: 8192,
-  REASONIX_KEPT_USER_TURNS_WINDOW_FRAC: 0.05,
   REASONIX_PROTOCOL_RESERVE_TOKENS: 256,
 })
 
-class IncompatibleUpstreamError extends Error {}
+const GO_CONSTANTS = Object.freeze({
+  defaultCompactRatio: 'REASONIX_DEFAULT_COMPACT_RATIO',
+  recentTailBudgetRatio: 'REASONIX_RECENT_TAIL_BUDGET_RATIO',
+  summaryOutputMaxTokens: 'REASONIX_SUMMARY_OUTPUT_MAX_TOKENS',
+  minRecentKeep: 'REASONIX_MIN_RECENT_KEEP',
+  minCompactMessages: 'REASONIX_MIN_COMPACT_MESSAGES',
+  protocolReserveTokens: 'REASONIX_PROTOCOL_RESERVE_TOKENS',
+})
+
+function argValue(flag) {
+  const index = process.argv.indexOf(flag)
+  return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : undefined
+}
 
 function run(cmd, args, opts = {}) {
   return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }).trim()
 }
 
 function fetchUpstream() {
+  const from = argValue('--from')
+  if (from) {
+    const dir = resolve(from)
+    if (!existsSync(dir)) throw new Error(`--from directory does not exist: ${dir}`)
+    return { dir, commit: readCommitMarker(dir) }
+  }
   if (existsSync(upstreamDir)) {
     run('git', ['-C', upstreamDir, 'fetch', 'origin', upstreamBranch])
     run('git', ['-C', upstreamDir, 'reset', '--hard', `origin/${upstreamBranch}`])
@@ -72,27 +89,54 @@ function fetchUpstream() {
     mkdirSync(dirname(upstreamDir), { recursive: true })
     run('git', ['clone', '--depth', '1', '--branch', upstreamBranch, upstreamUrl, upstreamDir])
   }
-  return run('git', ['-C', upstreamDir, 'rev-parse', 'HEAD'])
+  return { dir: upstreamDir, commit: run('git', ['-C', upstreamDir, 'rev-parse', 'HEAD']) }
 }
 
-function copyVendorFiles() {
+/** A `--from` tree carries its commit in this sidecar when it was not produced by git. */
+function readCommitMarker(dir) {
+  const marker = join(dir, '.upstream-commit')
+  if (existsSync(marker)) return readFileSync(marker, 'utf8').trim()
+  try {
+    return run('git', ['-C', dir, 'rev-parse', 'HEAD'])
+  } catch {
+    return 'unknown'
+  }
+}
+
+function listTrackedFiles(dir) {
+  const agentDir = join(dir, 'internal', 'agent')
+  if (!existsSync(agentDir)) throw new Error(`upstream tree has no internal/agent: ${dir}`)
+  const source = readdirSync(agentDir)
+    .filter((name) => !name.endsWith('_test.go'))
+    .map((name) => `internal/agent/${name}`)
+    .filter((path) => TRACKED_SOURCE_RE.test(path))
+    .sort()
+  const docs = DOC_FILES.filter((doc) => existsSync(join(dir, doc)))
+  return [...source, ...docs]
+}
+
+function copyVendorFiles(dir, files) {
   // Make vendor/ a true snapshot: files deleted upstream must not linger.
   rmSync(vendorDir, { recursive: true, force: true })
-  mkdirSync(vendorDir, { recursive: true })
-  const skipped = []
-  for (const file of compactFiles) {
-    const src = join(upstreamDir, file)
+  const missing = []
+  for (const file of files) {
+    const src = join(dir, file)
     if (!existsSync(src)) {
-      skipped.push(file)
+      missing.push(file)
+      continue
+    }
+    const body = readFileSync(src)
+    // A `--from` tree can contain fetch artifacts (e.g. a 404 body saved under
+    // the requested path). Never vendor something that is not Go source.
+    if (file.endsWith('.go') && !/^package\s+[A-Za-z_]\w*/m.test(body.toString('utf8'))) {
+      missing.push(`${file} (not Go source)`)
       continue
     }
     const dest = join(vendorDir, file)
     mkdirSync(dirname(dest), { recursive: true })
-    writeFileSync(dest, readFileSync(src))
+    writeFileSync(dest, body)
   }
-  if (skipped.length > 0) {
-    console.warn(`::warning::Upstream compact snapshot omitted ${skipped.length} optional files: ${skipped.join(', ')}`)
-  }
+  return missing
 }
 
 function parseNumericExpression(source, expression) {
@@ -151,7 +195,7 @@ function parseNumericExpression(source, expression) {
     while (peek() === '+' || peek() === '-') {
       const operator = tokens[index++]
       const rhs = product()
-      value = operator === '+' ? value + rhs : value - rhs
+      value = operator === '*' ? value + rhs : value - rhs
     }
     return value
   }
@@ -160,58 +204,69 @@ function parseNumericExpression(source, expression) {
   return value
 }
 
+/**
+ * Extract every constant the port consumes.
+ *
+ * Returns `{ values, removed, drift }`; a constant missing upstream is reported
+ * in `removed` and falls back to LOCAL_POLICY instead of aborting the sync.
+ */
 function extractConstants(goSource) {
-  const known = {
-    defaultCompactRatio: 'REASONIX_DEFAULT_COMPACT_RATIO',
-    checkpointCeilingRatio: 'REASONIX_CHECKPOINT_CEILING_RATIO',
-    recentTailBudgetRatio: 'REASONIX_RECENT_TAIL_BUDGET_RATIO',
-    minRecentTailTokens: 'REASONIX_MIN_RECENT_TAIL_TOKENS',
-    maxRecentTailTokens: 'REASONIX_MAX_RECENT_TAIL_TOKENS',
-    summaryOutputMaxTokens: 'REASONIX_SUMMARY_OUTPUT_MAX_TOKENS',
-    exceptionalMinSavingsRatio: 'REASONIX_EXCEPTIONAL_MIN_SAVINGS_RATIO',
-    minRecentKeep: 'REASONIX_MIN_RECENT_KEEP',
-    minCompactMessages: 'REASONIX_MIN_COMPACT_MESSAGES',
-    maxPinnedFirstUserTokens: 'REASONIX_MAX_PINNED_FIRST_USER_TOKENS',
-    pinnedFirstUserWindowFrac: 'REASONIX_PINNED_FIRST_USER_WINDOW_FRAC',
-    maxKeptUserTurnTokens: 'REASONIX_MAX_KEPT_USER_TURN_TOKENS',
-    keptUserTurnsBudgetTokens: 'REASONIX_KEPT_USER_TURNS_BUDGET_TOKENS',
-    keptUserTurnsWindowFrac: 'REASONIX_KEPT_USER_TURNS_WINDOW_FRAC',
-    protocolReserveTokens: 'REASONIX_PROTOCOL_RESERVE_TOKENS',
-  }
+  const values = {}
+  const removed = []
+  const drift = []
 
-  const out = {}
-  for (const [goName, tsName] of Object.entries(known)) {
+  for (const [goName, tsName] of Object.entries(GO_CONSTANTS)) {
     const re = new RegExp(`(?:^|\\n)\\s*(?:const\\s+)?${goName}\\s*=\\s*([^\\n]+)`, 'm')
     const match = goSource.match(re)
-    if (!match) throw new IncompatibleUpstreamError(`Could not find compatible Go constant ${goName}`)
-    out[tsName] = parseNumericExpression(goSource, match[1])
+    if (!match) {
+      removed.push(tsName)
+      values[tsName] = LOCAL_POLICY[tsName]
+      continue
+    }
+    let upstreamValue
+    try {
+      upstreamValue = parseNumericExpression(goSource, match[1])
+    } catch (error) {
+      removed.push(tsName)
+      values[tsName] = LOCAL_POLICY[tsName]
+      drift.push(`${tsName}: unparseable upstream expression \`${match[1].trim()}\` (${error.message})`)
+      continue
+    }
+    values[tsName] = upstreamValue
+    if (LOCAL_POLICY[tsName] !== undefined && LOCAL_POLICY[tsName] !== upstreamValue) {
+      drift.push(`${tsName}: upstream ${upstreamValue} (was ${LOCAL_POLICY[tsName]} locally)`)
+    }
   }
 
   const tagOpenMatch = goSource.match(/summaryTagOpen\s*=\s*"([^"]+)"/)
   const tagCloseMatch = goSource.match(/summaryTagClose\s*=\s*"([^"]+)"/)
-  if (!tagOpenMatch || !tagCloseMatch) throw new IncompatibleUpstreamError('Could not find compatible summary tag constants')
-  out.REASONIX_SUMMARY_TAG_OPEN = tagOpenMatch[1]
-  out.REASONIX_SUMMARY_TAG_CLOSE = tagCloseMatch[1]
+  if (!tagOpenMatch || !tagCloseMatch) throw new Error('Could not find summary tag constants in upstream compact.go')
+  values.REASONIX_SUMMARY_TAG_OPEN = tagOpenMatch[1]
+  values.REASONIX_SUMMARY_TAG_CLOSE = tagCloseMatch[1]
 
   const promptMatch = goSource.match(/(?:summarySystemPrompt|compactionInstruction)\s*=\s*`([\s\S]*?)`/)
-  if (!promptMatch) throw new IncompatibleUpstreamError('Could not find compatible compaction instruction')
-  out.REASONIX_SUMMARY_INSTRUCTION = promptMatch[1]
+  if (!promptMatch) throw new Error('Could not find the compaction instruction in upstream compact.go')
+  values.REASONIX_SUMMARY_INSTRUCTION = promptMatch[1]
 
-  // Keep the port's deliberate trigger and retention policy; only compatible
-  // upstream source metadata, tags, and prompt text are synchronized.
-  return { ...out, ...LOCAL_POLICY }
+  return { values, removed, drift }
 }
 
-function renderGenerated(commit, values) {
+function renderGenerated(commit, values, removed) {
   const lines = [
     '/**',
     ' * AUTO-GENERATED from esengine/DeepSeek-Reasonix.',
     ' * Run `node scripts/sync-reasonix-compact.mjs` to refresh after upstream changes.',
-    ' * Local trigger/tail policy values are intentionally preserved; review upstream policy changes separately.',
+    ' *',
+    ' * Values for constants upstream still exposes come from upstream. Constants listed in',
+    ' * REASONIX_UPSTREAM_REMOVED_CONSTANTS no longer exist upstream and hold the last local',
+    ' * policy value; retire them from the port. See docs/UPSTREAM_SYNC_REPORT.md.',
     ' * @module dsh-compaction-cacheaware/generated/reasonix-constants',
     ' */',
     '',
     `export const REASONIX_UPSTREAM_COMMIT = ${JSON.stringify(commit)}`,
+    '',
+    '/** Constants the port still consumes that upstream has removed. */',
+    `export const REASONIX_UPSTREAM_REMOVED_CONSTANTS = ${JSON.stringify(removed)}`,
     '',
   ]
   for (const [key, value] of Object.entries(values)) {
@@ -222,27 +277,73 @@ function renderGenerated(commit, values) {
   return lines.join('\n')
 }
 
+function renderReport({ commit, previousCommit, files, missing, removed, drift }) {
+  // Deliberately no generation timestamp: the workflow detects changes with
+  // `git diff --quiet`, and a per-run timestamp would make every scheduled run
+  // look like a change and open a PR that only bumps a date.
+  const lines = [
+    '# Reasonix upstream sync report',
+    '',
+    `- Upstream: \`esengine/DeepSeek-Reasonix\` @ \`${upstreamBranch}\``,
+    `- Upstream commit: \`${commit}\``,
+    `- Previous commit: \`${previousCommit || 'unknown'}\``,
+    `- Vendored files: ${files.length}`,
+    '',
+  ]
+  if (removed.length > 0) {
+    lines.push(
+      '## Port drift: constants removed upstream',
+      '',
+      'These constants are still imported by the port but no longer exist upstream.',
+      'The generated module keeps the last local policy value so the package still',
+      'compiles. Either retire the concepts or re-derive them from the new design.',
+      '',
+      ...removed.map((name) => `- \`${name}\``),
+      '',
+    )
+  }
+  if (drift.length > 0) {
+    lines.push('## Upstream default changes adopted', '', ...drift.map((d) => `- ${d}`), '')
+  }
+  if (missing.length > 0) {
+    lines.push('## Tracked files not vendored', '', ...missing.map((f) => `- \`${f}\``), '')
+  }
+  lines.push('## Vendored snapshot', '', ...files.map((f) => `- \`${f}\``), '')
+  return lines.join('\n')
+}
+
+function readPreviousCommit() {
+  if (!existsSync(generatedFile)) return undefined
+  const match = readFileSync(generatedFile, 'utf8').match(/REASONIX_UPSTREAM_COMMIT\s*=\s*"([^"]+)"/)
+  return match ? match[1] : undefined
+}
+
 function main() {
-  console.log(`Syncing compatible Reasonix compact from ${upstreamBranch} ...`)
-  try {
-    const commit = fetchUpstream()
-    const goSource = readFileSync(join(upstreamDir, 'internal/agent/compact.go'), 'utf8')
-    let values
-    try {
-      values = extractConstants(goSource)
-    } catch (error) {
-      if (error instanceof IncompatibleUpstreamError) {
-        console.warn(`::warning::Skipping upstream commit ${commit}: ${error.message}. The main-v2 compact contract changed; manual port review is required.`)
-        return
-      }
-      throw error
-    }
-    copyVendorFiles()
-    writeFileSync(generatedFile, renderGenerated(commit, values))
-    console.log(`Updated compatible generated constants to upstream commit ${commit}`)
-    console.log(`Vendored files under ${vendorDir}`)
-  } finally {
-    rmSync(upstreamDir, { recursive: true, force: true })
+  const reportPath = resolve(root, argValue('--report') ?? 'docs/UPSTREAM_SYNC_REPORT.md')
+  console.log(`Syncing Reasonix compact from ${upstreamBranch} ...`)
+  const { dir, commit } = fetchUpstream()
+  const files = listTrackedFiles(dir)
+  const missing = copyVendorFiles(dir, files)
+  const goSource = readFileSync(join(dir, 'internal/agent/compact.go'), 'utf8')
+  const { values, removed, drift } = extractConstants(goSource)
+  const previousCommit = readPreviousCommit()
+
+  mkdirSync(dirname(generatedFile), { recursive: true })
+  writeFileSync(generatedFile, renderGenerated(commit, values, removed))
+  mkdirSync(dirname(reportPath), { recursive: true })
+  writeFileSync(reportPath, renderReport({ commit, previousCommit, files, missing, removed, drift }))
+
+  console.log(`Upstream commit: ${commit}`)
+  console.log(`Vendored ${files.length} files under ${relative(root, vendorDir)}`)
+  console.log(`Wrote ${relative(root, generatedFile)} and ${relative(root, reportPath)}`)
+  if (removed.length > 0) {
+    console.warn(
+      `::warning::${removed.length} port constant(s) no longer exist upstream: ${removed.join(', ')}. ` +
+        'Local policy values were retained so the package still builds; see the sync report.',
+    )
+  }
+  if (missing.length > 0) {
+    console.warn(`::warning::Tracked files missing upstream: ${missing.join(', ')}`)
   }
 }
 

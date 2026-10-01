@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -24,9 +25,22 @@ type summaryProjectionCommit struct {
 // transcript version/hash, projection version, and generation must still match.
 // The maintenance event is emitted only after the lock is released so a sink
 // that re-enters ContextMaintenanceSnapshot cannot deadlock.
-func (a *Agent) commitSummaryProjection(commit summaryProjectionCommit) (CompactionState, error) {
+func (a *Agent) commitSummaryProjection(ctx context.Context, commit summaryProjectionCommit) (CompactionState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return CompactionState{}, err
+	}
 	state := a.summaryProjectionState(commit)
 	a.sess.compactionMu.Lock()
+	// This is the shared commit boundary for ordinary, positional, and fallback
+	// summary projection installs. Cancellation that wins before this point
+	// prevents every variant from publishing a late summary.
+	if err := ctx.Err(); err != nil {
+		a.sess.compactionMu.Unlock()
+		return CompactionState{}, err
+	}
 	current, currentVersion := a.sess.conversation.snapshotMessagesVersion()
 	if currentVersion != commit.transcriptVersion ||
 		len(current) != len(commit.canonical) ||
@@ -38,7 +52,15 @@ func (a *Agent) commitSummaryProjection(commit summaryProjectionCommit) (Compact
 	}
 	prev := a.sess.compactionState
 	a.sess.compactionState = state
-	if err := a.persistCompactionStateLocked(); err != nil {
+	// After installation begins we finish its consistency and durability work;
+	// cancellation may prevent a later batch but cannot tear this batch in half.
+	accepted, err := a.persistInstalledProjectionLocked(context.Background(), state, current)
+	if err != nil {
+		if accepted {
+			a.sess.checkpointState = "pending"
+			a.sess.compactionMu.Unlock()
+			return CompactionState{}, fmt.Errorf("persist projection: %w", err)
+		}
 		a.sess.compactionState = prev
 		a.sess.compactionMu.Unlock()
 		if errors.Is(err, errCompressStaleContext) {
@@ -54,6 +76,44 @@ func (a *Agent) commitSummaryProjection(commit summaryProjectionCommit) (Compact
 	a.sess.compactionMu.Unlock()
 	a.emitContextMaintenance(receipt)
 	return state, nil
+}
+
+func (a *Agent) persistInstalledProjectionLocked(ctx context.Context, state CompactionState, canonical []provider.Message) (bool, error) {
+	accepted := false
+	if recorder, ok := a.svc.sessionCheckpointer.(SessionModelContextRecorder); ok {
+		visible := modelVisibleFromProjection(state.Projection, canonical)
+		commit := cloneSessionModelContextCommit(SessionModelContextCommit{
+			OperationID: state.LastReceipt.OperationID,
+			Reason:      state.LastReceipt.Action,
+			Messages:    visible,
+		})
+		result, err := recorder.RecordSessionModelContext(ctx, commit)
+		accepted = result.Accepted
+		if err != nil {
+			if accepted {
+				a.sess.pendingModelContextCommit = &commit
+			}
+			return accepted, err
+		}
+		if result.Accepted && !result.Durable {
+			a.sess.pendingModelContextCommit = &commit
+			return true, errors.New("model context commit was accepted but is not durable")
+		}
+	}
+	if err := a.persistCompactionStateLocked(); err != nil {
+		if accepted {
+			visible := modelVisibleFromProjection(state.Projection, canonical)
+			commit := cloneSessionModelContextCommit(SessionModelContextCommit{
+				OperationID: state.LastReceipt.OperationID,
+				Reason:      state.LastReceipt.Action,
+				Messages:    visible,
+			})
+			a.sess.pendingModelContextCommit = &commit
+		}
+		return accepted, err
+	}
+	a.sess.pendingModelContextCommit = nil
+	return accepted, nil
 }
 
 func (a *Agent) summaryProjectionState(commit summaryProjectionCommit) CompactionState {
@@ -77,7 +137,8 @@ func (a *Agent) summaryProjectionState(commit summaryProjectionCommit) Compactio
 		Projection: ContextProjection{
 			Messages: commit.projected, TranscriptVersion: commit.transcriptVersion,
 			ProjectionVersion: projectionVersion, CoveredCount: commit.covered, CoveredPrefixHash: coveredHash,
-			SummaryHash: summaryHash, SourceTokens: commit.sourceTokens, ProjectionTokens: commit.projectionTokens,
+			PinnedContextHash: pinnedContextCoverageHash(commit.canonical, commit.covered),
+			SummaryHash:       summaryHash, SourceTokens: commit.sourceTokens, ProjectionTokens: commit.projectionTokens,
 			ViewInputHash: commit.inputHash, ViewOutputHash: commit.outputHash, CreatedAt: now,
 		},
 		LastReceipt: receipt, UpdatedAt: now,

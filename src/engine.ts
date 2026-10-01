@@ -7,8 +7,9 @@
  *   - `compactRegion` for programmatic range compaction.
  *
  * The durable transaction mirrors DSH's official `compaction/start → summary →
- * replace → end` bracket while adding Reasonix's checkpoint acceptance checks
- * (≤50% ceiling, below compact_ratio, exceptional fixed-prefix path).
+ * replace → end` bracket. A checkpoint must strictly reduce estimated tokens;
+ * automatic compaction must also land below the physical input ceiling. Manual
+ * compaction is an explicit rescue and may remain above that ceiling.
  *
  * @module dsh-compaction-cacheaware/engine
  */
@@ -24,6 +25,7 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
@@ -34,8 +36,9 @@ import {
   contentHasImage,
   createUserMessage,
   errorChain,
+  projectToolUpdates,
 } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, Message, TokenUsage, ToolSchema, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, LlmResolvedModelInfo, Message, RequestMessage, RequestUserInput, TokenUsage, ToolSchema, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import { resolveCompactSpec, resolveConfig, type CacheAwareCompactionConfig, type CacheAwareCompactSpec, type ResolvedCacheAwareConfig } from './config.js'
 import { REASONIX_SUMMARY_INSTRUCTION, frameSummary } from './prompt.js'
@@ -53,11 +56,22 @@ export class TargetPressureConfigError extends Error {
   }
 }
 
-/** Summarizer input: replayed conversation prefix, aligned to the provider cache. */
+/**
+ * Summarizer input: replayed conversation prefix, aligned to the provider cache.
+ *
+ * There is deliberately no separate `system` field: since the session format
+ * made the system prompt derived history (surface node 0, a `system/message`
+ * event), the conversation's own request carries it as a leading message. A
+ * summarizer request only reuses the provider's KV cache if it is a genuine
+ * prefix of that conversation, so the system prompt rides in `messages`.
+ *
+ * `messages` accepts request-only user inputs as well as durable messages: the
+ * compaction directive appended after the replay is a temporary input with no
+ * durable session identity or source.
+ */
 export interface SummarizationInput {
-  readonly system?: string
   readonly tools?: readonly ToolSchema[]
-  readonly messages: readonly Message[]
+  readonly messages: readonly RequestMessage[]
 }
 
 /** Safe summary plus the exact auxiliary call envelope. */
@@ -121,12 +135,28 @@ function conversationTarget(agent: Agent): { provider: string; model: string } |
 }
 
 /**
+ * Output tokens the routed request reserves, which the provider charges to the
+ * same window as the prompt. The effective envelope's own cap wins; otherwise
+ * the adapter's per-request default, which the adapter materializes when that
+ * envelope omits one. No declared cap means no reservation.
+ */
+function reservedCompletionTokens(agent: Agent, defaultMaxTokens: number | undefined): number {
+  return agent.session.requestHeader()?.config.maxTokens ?? defaultMaxTokens ?? 0
+}
+
+/**
  * Read the realm's current `ctx.compaction` owner without throwing when no
  * engine is provided yet (the context proxy raises on unknown services).
  */
 function readExistingCompactionService(ctx: Context): unknown {
   try {
-    return (ctx as { compaction?: unknown }).compaction
+    const current = (ctx as { compaction?: unknown }).compaction
+    if (current === null || (typeof current !== 'object' && typeof current !== 'function')) return current
+    // Cordis returns traceable service proxies from context property reads.
+    // Compare the provided instance, not a fresh proxy wrapper, or this engine
+    // would incorrectly stand down every automatic listener immediately.
+    const original = (current as Record<PropertyKey, unknown>)[Symbol.for('cordis.original')]
+    return original ?? current
   } catch {
     return undefined
   }
@@ -139,8 +169,14 @@ function describeCompactionEngine(value: unknown): string {
   return typeof value
 }
 
-/** Inspect open-turn, unmatched-compaction, and latest seed-boundary state. */
-function inspectCompactionEntryState(events: readonly SessionEvent[]): {
+/**
+ * Inspect open-turn, unmatched-compaction, and latest seed-boundary state.
+ *
+ * Reads the log through `session.eventAt()` rather than a materialized event
+ * array: the session no longer exposes its log as a property, and the official
+ * `dsh-compaction-basic` backend walks it the same way.
+ */
+function inspectCompactionEntryState(session: Session): {
   openTurn: number | null
   unmatchedCompactionStart: SessionEvent | undefined
   latestEndSeedSeq: number | undefined
@@ -150,8 +186,9 @@ function inspectCompactionEntryState(events: readonly SessionEvent[]): {
   let unmatchedCompactionStart: SessionEvent | undefined
   let compactionEntryStateKnown = false
   let latestEndSeedSeq: number | undefined
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(SessionSeq(seq))
+    if (event === undefined) continue
     if (latestEndSeedSeq === undefined && event.type === 'session/end-seed') latestEndSeedSeq = event.seq
     if (!compactionEntryStateKnown) {
       if (event.type === 'compaction/start') {
@@ -198,49 +235,124 @@ function sanitizeSummarizationMessage(message: Message): Message {
   }
 }
 
-function portableBlockText(block: ContentBlock): string {
+/** Durable file reference carried by one `file` content block. */
+type FileAttachment = Extract<ContentBlock, { type: 'file' }>['attachment']
+
+/**
+ * Text for one content block in the provider-neutral fallback transcript.
+ *
+ * A tool result is no longer an embedded content block: it is a `tool`-role
+ * message, rendered by {@link portableMessageText} with the call identity that
+ * pairs it to its tool call. A file reuses the host's own request-time handle —
+ * the only representation a provider ever receives for one. Tool-change blocks
+ * get one explicit line each instead of a serialized dump: the transcript
+ * carries no declarations of its own, so those records are the only channel that
+ * keeps a mid-conversation addition or removal visible to the summarizer.
+ */
+function portableBlockText(block: ContentBlock, fileText: (ref: FileAttachment) => string): string {
   switch (block.type) {
     case 'text':
       return block.text
     case 'reasoning':
       return ''
-    case 'image':
-      return '[image omitted]'
+    case 'image': {
+      // An image is explicitly LOSSY here: the transcript is plain text, so the
+      // occurrence is reported from its own durable reference — attachment id,
+      // display name when it has one, and the offload mark — and no path is ever
+      // fabricated. The normal summarization path leaves image projection to the
+      // LLM runtime instead of going through this renderer.
+      const { attachment } = block
+      const named = attachment.name === undefined ? '' : ` ${attachment.name}`
+      const offloaded = block.offloaded === true ? ' offloaded' : ''
+      return `[image omitted${offloaded}:${named} ${String(attachment.attachmentId)}]`
+    }
     case 'tool-call':
-      return `[tool-call ${block.name}] ${block.arguments}`
-    case 'tool-result':
-      return `[tool-result ${block.toolCallId}] ${block.content.map(portableBlockText).filter(Boolean).join('\\n')}`
+      // The call id stays visible so repeated calls to one tool remain
+      // correlatable with the tool-role result that answers each of them.
+      return `[tool-call ${String(block.id)} ${block.name}] ${block.arguments}`
+    case 'file':
+      return fileText(block.attachment)
+    case 'tool-addition':
+      return `[tool-addition ${block.toolName}]`
+    case 'tool-removal':
+      return `[tool-removal ${block.toolName}]`
     default:
       return ''
   }
 }
 
-function buildPortableSummarizationInput(input: SummarizationInput): SummarizationInput {
-  const transcript = input.messages
-    .map((message) => {
-      const body = message.content.map(portableBlockText).filter(Boolean).join('\\n')
-      return `[${message.role}]\\n${body}`
-    })
-    .join('\\n\\n')
+/**
+ * One transcript entry, keeping a tool result's call identity visible. A failed
+ * result states its outcome and is rendered even when it carries no text, so the
+ * pair never silently disappears.
+ */
+function portableMessageText(message: RequestMessage, fileText: (ref: FileAttachment) => string): string {
+  const body = message.content.map((block) => portableBlockText(block, fileText)).filter(Boolean).join('\n')
+  if (message.role === 'tool') {
+    const header = `[tool ${String(message.toolCallId)}${message.isError === true ? ' error' : ''}]`
+    return body.length === 0 ? header : `${header}\n${body}`
+  }
+  return body.length === 0 ? '' : `[${message.role}]\n${body}`
+}
+
+/**
+ * Last-resort input for a route that rejected the provider-neutral replay.
+ *
+ * The transcript is plain text, so nothing is serialized verbatim: the declared
+ * tool set comes from the host's own `projectToolUpdates` projection, files come
+ * from the host's request-time handle, and tool changes become explicit lines.
+ * Messages keep their original order, so a tool call and the tool result
+ * answering it stay adjacent and paired.
+ */
+function buildPortableSummarizationInput(input: SummarizationInput, fileText: (ref: FileAttachment) => string): SummarizationInput {
+  const declared = projectToolUpdates(
+    input.messages,
+    input.tools === undefined ? undefined : [...input.tools],
+    undefined,
+  ).tools ?? []
+  const sections = [
+    ...(declared.length === 0 ? [] : [`[tools]\n${declared.map((tool) => tool.name).join(', ')}`]),
+    ...input.messages.map((message) => portableMessageText(message, fileText)).filter(Boolean),
+  ]
   return {
-    messages: [createUserMessage({
-      content: [{ type: 'text', text: `Conversation transcript (provider-neutral fallback):\\n\\n${transcript}` }],
-      source: { kind: 'plugin', plugin: 'dsh-compaction-cacheaware' },
-    })],
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: `Conversation transcript (provider-neutral fallback):\n\n${sections.join('\n\n')}` }],
+    }],
   }
 }
 
+/**
+ * The `system/message` holding surface node 0, or `undefined` when another
+ * message-producing event starts the surface.
+ */
+function systemHead(session: Session): SessionEvent | undefined {
+  const headSeq = session.surface.nodes[0]
+  if (headSeq === undefined) return undefined
+  const head = session.eventAt(headSeq)
+  return head?.type === 'system/message' ? head : undefined
+}
+
+/**
+ * Reconstruct the last routed request's cacheable prefix for the shadowed
+ * region: the system prompt held by the `system/message` at surface node 0,
+ * the header's tool schemas, then the region's own derived messages in surface
+ * order. The summarizer appends only the compaction instruction after this, so
+ * the call is a genuine prefix of the conversation and reuses the provider's
+ * KV cache.
+ */
 function buildSummarizationInput(session: Session, shadowedSeqs: readonly number[]): SummarizationInput {
   const header = session.requestHeader()
-  const events = session.events
+  const head = systemHead(session)
+  const systemMessage = head === undefined ? null : session.deriveEventMessage(head)
   const regionMessages = shadowedSeqs
-    .map((seq) => session.deriveEventMessage(events[seq]!))
+    .map((seq) => session.eventAt(SessionSeq(seq)))
+    .map((event) => (event === undefined ? null : session.deriveEventMessage(event)))
     .filter((message): message is Message => message !== null)
     .map(sanitizeSummarizationMessage)
   return {
-    ...(header?.system === undefined ? {} : { system: header.system }),
     ...(header?.tools === undefined ? {} : { tools: [...header.tools] }),
-    messages: regionMessages,
+    messages: systemMessage === null ? regionMessages : [systemMessage, ...regionMessages],
   }
 }
 
@@ -251,18 +363,25 @@ function buildSummarizationInput(session: Session, shadowedSeqs: readonly number
 export class CacheAwareCompactionEngine extends CompactionEngine {
   static inject = ['llm', 'tokenMeter', 'sessions'] as const
 
-  static Config = z.object({
+  // Explicitly annotated: the host packages resolve their own schemastery
+  // instance, so relying on this schema's inferred type would make declaration
+  // emit depend on which physical copy of the package wins resolution.
+  static Config: z<{
+    compactRatio: number
+    recentTailRatio: number
+    summaryMaxTokens: number
+    minRecentKeep: number
+    minCompactMessages: number
+    protocolReserveTokens: number
+    summarizationProvider: string
+    summarizationModel: string
+    auto: boolean
+  }> = z.object({
     compactRatio: z.number(),
-    checkpointCeilingRatio: z.number(),
     recentTailRatio: z.number(),
-    recentTailMinTokens: z.number(),
-    recentTailMaxTokens: z.number(),
     summaryMaxTokens: z.number(),
-    exceptionalMinSavingsRatio: z.number(),
     minRecentKeep: z.number(),
     minCompactMessages: z.number(),
-    maxPinnedFirstUserTokens: z.number(),
-    pinnedFirstUserWindowFrac: z.number(),
     protocolReserveTokens: z.number(),
     summarizationProvider: z.string(),
     summarizationModel: z.string(),
@@ -324,7 +443,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
           if (result !== null) logResult(result, 'step pressure')
         } catch (error) {
           if (error instanceof TargetPressureConfigError) {
-            // Warn once per target, then continue the turn.
+            // Report the affected target, then continue the turn.
             ctx.logger.warn(`step compaction configuration failed for ${error.targetKey}: ${error.message}; continuing the turn`)
           } else {
             const message = error instanceof Error ? error.message : String(error)
@@ -487,18 +606,18 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
     const assembler = new BlockAssembler()
-    const messages = [
-      ...input.messages,
-      createUserMessage({
-        content: [{ type: 'text', text: REASONIX_SUMMARY_INSTRUCTION }],
-        source: { kind: 'plugin', plugin: 'dsh-compaction-cacheaware' },
-      }),
-    ]
+    // The directive is a temporary request-only user input: it has no durable
+    // session identity or source, so it cannot claim a producer it does not have.
+    const directive: RequestUserInput = {
+      role: 'user',
+      content: [{ type: 'text', text: REASONIX_SUMMARY_INSTRUCTION }],
+    }
+    const messages: RequestMessage[] = [...input.messages, directive]
     const options = {
       provider,
       model,
       messages,
-      ...(input.system === undefined ? {} : { system: input.system }),
+      toolHistory: agent.session.toolHistory(),
       ...(input.tools === undefined ? {} : { tools: [...input.tools] }),
       maxTokens: this.config.summaryMaxTokens,
       sessionId: agent.session.id,
@@ -545,6 +664,10 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
         const code = (error as { code?: unknown })?.code ?? (error as { cause?: { code?: unknown } })?.cause?.code
         if (typeof code === 'string') sanitizedAttempts[sanitizedAttempts.length - 1] += ` (${code})`
 
+        // Cancellation is not a candidate failure: never spend another request
+        // — the portable retry below or the next route — on an aborted operation.
+        signal?.throwIfAborted()
+
         // Some OpenAI-compatible gateways reject a valid provider-neutral
         // conversation replay because of assistant/tool item pairing rules.
         // Retry the same route once with a plain-text transcript: this keeps
@@ -555,7 +678,7 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
             return await this.summarizeWithCandidate(
               candidate.provider,
               candidate.model,
-              buildPortableSummarizationInput(input),
+              buildPortableSummarizationInput(input, (ref) => this.ctx.get('llm')!.fileRequestText(ref)),
               agent,
               signal,
             )
@@ -564,9 +687,11 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
             const portableMsg = portableError instanceof Error ? portableError.message : String(portableError)
             attempts.push(`${candidate.provider}/${candidate.model} portable fallback: ${portableMsg}`)
             sanitizedAttempts.push(`${candidate.provider}/${candidate.model} portable fallback: ${this.sanitizeErrorMessage(portableMsg)}`)
+            // Checked before either `continue`, so an abort cannot be swallowed
+            // into another candidate attempt.
+            signal?.throwIfAborted()
             if (!this.isNonCandidateRetryableError(portableError)) continue
             if (!this.isRetriableSummarizeError(portableError)) continue
-            signal?.throwIfAborted()
             continue
           }
         }
@@ -618,12 +743,15 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     }
 
     // pressure
-    const context = (await this.ctx.get('llm')!.resolveModelInfo(target.provider, target.model, signal)).context
+    const info = await this.ctx.get('llm')!.resolveModelInfo(target.provider, target.model, signal)
+    const context = info.context
     const targetKey = `${target.provider}/${target.model}`
     if (context === undefined) {
       throw new TargetPressureConfigError(targetKey, `CacheAwareCompaction: no context capacity for ${targetKey}; configure contextWindow on that adapter model`)
     }
-    const spec = resolveCompactSpec(this.config, context.contextWindow)
+    // The routed request's output reservation shares the window with its prompt,
+    // so the input budgets are computed below it.
+    const spec = resolveCompactSpec(this.config, context.contextWindow, reservedCompletionTokens(agent, info.defaultMaxTokens))
     if (measurement.totalTokens < spec.thresholdTokens) return null
     if (prune !== undefined) {
       prune.pruneSession(agent.session)
@@ -659,8 +787,10 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
 
   async compactNow(agent: Agent, signal: AbortSignal, sourceCommandId?: CommandId): Promise<CompactionResult | null> {
     signal.throwIfAborted()
+    let maintenanceEntered = false
     try {
       return await agent.runMaintenance(async (agentSignal) => {
+        maintenanceEntered = true
         const operationSignal = AbortSignal.any([agentSignal, signal])
         try {
           operationSignal.throwIfAborted()
@@ -687,6 +817,10 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       })
     } catch (error) {
       if (error instanceof ManualCompactionError) throw error
+      // User cancellation is not a busy agent: surface the abort reason instead
+      // of classifying it as an unavailable idle session.
+      signal.throwIfAborted()
+      if (maintenanceEntered) throw error
       throw new ManualCompactionError('busy', 'manual compaction requires an idle agent with no waking queued work', { cause: error })
     }
   }
@@ -698,12 +832,13 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
     if (route === undefined) return null
     // Best-effort context capacity for selection; force/overflow may still
     // proceed with a minimal recent tail when the adapter exposes no capacity.
-    const context = (await this.ctx.get('llm')!.resolveModelInfo(route.provider, route.model)).context
+    const info = await this.ctx.get('llm')!.resolveModelInfo(route.provider, route.model)
+    const context = info.context
     if (context === undefined) {
       if (force) return selectOverflowRange(agent.session, measurement, this.config)
       return null
     }
-    const spec = resolveCompactSpec(this.config, context.contextWindow)
+    const spec = resolveCompactSpec(this.config, context.contextWindow, reservedCompletionTokens(agent, info.defaultMaxTokens))
     return selectReasonixRange(agent.session, measurement, this.config, spec, this.ctx.tokenMeter, force)
   }
 
@@ -724,19 +859,20 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       startIdx,
       endIdx,
       shadowedSeqs: shadowed.map((n) => n.seq),
-      shadowedTokenCount: shadowed.reduce((sum, n) => sum + n.tokens, 0),
+      shadowedTokenCount: shadowed.reduce((sum, n) => sum + n.heuristicTokens, 0),
+      shadowedRouteTokenCount: shadowed.reduce((sum, n) => sum + n.tokens, 0),
     }
   }
 
   private async _compactSurfaceRegion(
     agent: Agent,
-    range: { start: number; end: number; startIdx: number; endIdx: number; shadowedSeqs: number[]; shadowedTokenCount: number },
+    range: { start: number; end: number; startIdx: number; endIdx: number; shadowedSeqs: number[]; shadowedTokenCount: number; shadowedRouteTokenCount: number },
     options: CompactionTransactionOptions,
     signal?: AbortSignal,
   ): Promise<CompactionResult> {
     const session = agent.session
     if (options.owner === null) signal?.throwIfAborted()
-    const entryState = inspectCompactionEntryState(session.events)
+    const entryState = inspectCompactionEntryState(session)
     assertCompactionInactive(entryState.unmatchedCompactionStart, entryState.latestEndSeedSeq, 'compaction')
 
     let owner: number | null
@@ -770,6 +906,20 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       if (selectedNodes.length !== range.shadowedSeqs.length || selectedNodes.some((node, index) => node.seq !== range.shadowedSeqs[index])) {
         throw new SurfaceChangedError('compaction: selected surface changed before summarization began')
       }
+      // Selection may await route metadata. Refresh both prices from this
+      // transaction's measurement, so acceptance and persisted shadow prices
+      // cannot mix the selection snapshot with the prepared snapshot.
+      range = {
+        ...range,
+        shadowedTokenCount: selectedNodes.reduce((sum, node) => sum + node.heuristicTokens, 0),
+        shadowedRouteTokenCount: selectedNodes.reduce((sum, node) => sum + node.tokens, 0),
+      }
+      // Snapshot the CONVERSATION route's budgets before summarizing. The
+      // checkpoint replaces conversation history and is accepted on the
+      // conversation meter's terms, so a summarizer fallback onto a smaller
+      // window must not veto it — and re-resolving the original route afterwards
+      // could contact a provider that just failed.
+      const spec = await this._specFor(agent, signal)
       const input = buildSummarizationInput(session, range.shadowedSeqs)
       const summaryResult = await this.summarize(input, agent, signal)
       if (options.owner === null) signal?.throwIfAborted()
@@ -781,26 +931,24 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       })
       const framedSummaryTokenCount = this.ctx.tokenMeter.estimateMessage(checkpointMessage)
       const sourceTokens = measurement.totalTokens
-      const candidateTokens = sourceTokens - range.shadowedTokenCount + framedSummaryTokenCount
+      // Budgets and the acceptance decision compare against the measured
+      // request, so the replaced range is priced on the same route-priced scale.
+      // The persisted shadow price below stays heuristic: the meter folds a
+      // replacement with the fixed estimator, not with a route price.
+      const candidateTokens = sourceTokens - range.shadowedRouteTokenCount + framedSummaryTokenCount
       const fixedPrefix = fixedPrefixTokens(measurement, range.startIdx)
-      // The summarizer may have fallen back to a different provider/model than
-      // the conversation's latest routed target. Price and validate the
-      // checkpoint against the route that actually produced the summary; using
-      // routedTarget() here can re-contact a dead provider and turn a successful
-      // fallback into a misleading generic "summary" failure.
-      const spec = await this._specFor(agent, signal, {
-        provider: summaryResult.provider,
-        model: summaryResult.model,
-      })
       if (spec !== null) {
+        // Upstream rejects a fold whose fixed prefix alone already crosses the
+        // trigger: no checkpoint can bring such a request back under it. Mirrors
+        // compact_projection.go.
+        if (fixedPrefix >= spec.thresholdTokens) {
+          throw new Error(`checkpoint rejected: fixed prefix (${fixedPrefix} tokens) already exceeds trigger (${spec.thresholdTokens})`)
+        }
         acceptCheckpointCandidate({
           trigger: options.trigger,
-          force: options.force,
           sourceTokens,
           candidateTokens,
-          fixedPrefixTokens: fixedPrefix,
           spec,
-          config: this.config,
         })
       } else if (candidateTokens >= sourceTokens) {
         throw new Error(`checkpoint rejected: candidate would not reduce tokens (${candidateTokens} >= ${sourceTokens})`)
@@ -881,8 +1029,8 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       ...((startEvent.data as { sourceCommandId?: CommandId }).sourceCommandId === undefined ? {} : { sourceCommandId: (startEvent.data as { sourceCommandId?: CommandId }).sourceCommandId }),
       summary,
       ...callProvenance,
-      shadowedRange: { start, end },
-      shadowedSeqs: [...shadowedSeqs],
+      shadowedRange: { start: SessionSeq(start), end: SessionSeq(end) },
+      shadowedSeqs: shadowedSeqs.map((seq) => SessionSeq(seq)),
       shadowedTokenCount,
       provider,
       model,
@@ -890,8 +1038,8 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       ...(usage === undefined ? {} : { usage }),
     })
     session.append('user/message', checkpointMessage, {
-      surfaceOp: { op: 'replace', start, end },
-      sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
+      surfaceOp: { op: 'replace', startSeq: SessionSeq(start), endSeq: SessionSeq(end) },
+      sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs.map((seq) => SessionSeq(seq))],
     })
     return {
       compactionId: (startEvent.data as { compactionId: CompactionId }).compactionId,
@@ -899,8 +1047,8 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
       startSeq: startEvent.seq,
       summarySeq: summaryEvent.seq,
       summary,
-      shadowedRange: { start, end },
-      shadowedSeqs: [...shadowedSeqs],
+      shadowedRange: { start: SessionSeq(start), end: SessionSeq(end) },
+      shadowedSeqs: shadowedSeqs.map((seq) => SessionSeq(seq)),
       shadowedTokenCount,
     }
   }
@@ -914,28 +1062,58 @@ export class CacheAwareCompactionEngine extends CompactionEngine {
 
   private _assertSelectedSpanStable(session: Session, range: { start: number; end: number; shadowedSeqs: number[] }, preparedMeasurement: ReturnType<typeof this.ctx.tokenMeter.measure>): void {
     let current: ReturnType<typeof this.ctx.tokenMeter.measure>
+    let startIdx: number
+    let endIdx: number
     try {
       current = this.ctx.tokenMeter.measure(session)
-      const startIdx = current.nodes.findIndex((n) => n.seq === range.start)
-      const endIdx = current.nodes.findIndex((n) => n.seq === range.end)
+      startIdx = current.nodes.findIndex((n) => n.seq === range.start)
+      endIdx = current.nodes.findIndex((n) => n.seq === range.end)
       if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) throw new Error('span missing')
-      const currentSeqs = current.nodes.slice(startIdx, endIdx + 1).map((n) => n.seq)
-      if (!isDeepStrictEqual(currentSeqs, range.shadowedSeqs)) throw new Error('span changed')
+      // Both edges must still be balanced, or the replacement could split a
+      // tool-call/result pair (official `validateSurfaceRegion`).
+      if (!toolPairingBalancedBefore(session, SessionSeq(range.start))) throw new Error('span start is not a balanced boundary')
+      if (!toolPairingBalancedAfter(session, SessionSeq(range.end))) throw new Error('span end is not a balanced boundary')
     } catch (error) {
       throw new SurfaceChangedError('compaction: the selected span is no longer a valid replacement target', { cause: error })
     }
+    const currentSpan = current.nodes.slice(startIdx, endIdx + 1)
+    if (!isDeepStrictEqual(currentSpan.map((node) => node.seq), range.shadowedSeqs)) {
+      throw new SurfaceChangedError('compaction: the selected span changed during summarization')
+    }
+    // The span must still be priced exactly as it was when the summary started.
+    // Comparing seqs alone would accept a same-seq repricing — an image offload
+    // or tool-result prune that rewrites a selected node — and then price the
+    // checkpoint against stale numbers. Appends outside the span stay legal.
+    const preparedStartIdx = preparedMeasurement.nodes.findIndex((n) => n.seq === range.start)
+    const preparedEndIdx = preparedMeasurement.nodes.findIndex((n) => n.seq === range.end)
+    if (preparedStartIdx === -1 || preparedEndIdx === -1
+      || !isDeepStrictEqual(currentSpan, preparedMeasurement.nodes.slice(preparedStartIdx, preparedEndIdx + 1))) {
+      throw new SurfaceChangedError('compaction: the selected span was rewritten during summarization')
+    }
   }
 
-  private async _specFor(
-    agent: Agent,
-    signal?: AbortSignal,
-    preferredTarget?: { provider: string; model: string },
-  ): Promise<CacheAwareCompactSpec | null> {
-    const target = preferredTarget ?? routedTarget(agent.session) ?? conversationTarget(agent)
+  /**
+   * Resolve the budgets a checkpoint is accepted against, from the conversation
+   * route that will send it: the summary fallback's own window and output budget
+   * deliberately play no part in that decision.
+   *
+   * `null` means only that the route's metadata was unavailable, so the caller
+   * falls back to the simple reduction check. A budget failure is a real
+   * configuration defect and is deliberately not masked here, and cancellation
+   * keeps its own abort reason.
+   */
+  private async _specFor(agent: Agent, signal?: AbortSignal): Promise<CacheAwareCompactSpec | null> {
+    const target = routedTarget(agent.session) ?? conversationTarget(agent)
     if (target === undefined) return null
-    const context = (await this.ctx.get('llm')!.resolveModelInfo(target.provider, target.model, signal)).context
-    if (context === undefined) return null
-    return resolveCompactSpec(this.config, context.contextWindow)
+    let info: LlmResolvedModelInfo
+    try {
+      info = await this.ctx.get('llm')!.resolveModelInfo(target.provider, target.model, signal)
+    } catch (error) {
+      if (signal?.aborted) throw error
+      return null
+    }
+    if (info.context === undefined) return null
+    return resolveCompactSpec(this.config, info.context.contextWindow, reservedCompletionTokens(agent, info.defaultMaxTokens))
   }
 }
 
@@ -948,6 +1126,8 @@ function throwManualFailure(failure: { error: unknown; stage: string }): never {
   if (failure.error instanceof SurfaceChangedError) throw new ManualCompactionError('changed', 'the compacted history changed during manual compaction', { cause: failure.error })
   // Preserve the structured candidate chain at the manual surface so users
   // see provider/model/code information instead of only a generic sentence.
-  if (failure.error instanceof Error && /all summarization candidates failed|summarization failed:/i.test(failure.error.message)) throw failure.error
+  if (failure.error instanceof Error && /all summarization candidates failed|summarization failed:|no summarization candidates available|no provider\/model available/i.test(failure.error.message)) {
+    throw new ManualCompactionError('summary', failure.error.message, { cause: failure.error })
+  }
   throw new ManualCompactionError('summary', 'manual compaction could not produce a smaller summary', { cause: failure.error })
 }

@@ -1,8 +1,17 @@
 # Content-Driven Context Maintenance（Cache-Aware Checkpoint）
 
 > 日期：2026-08-10
-> 状态：当前实现说明（取代多阈值 prune/snip/native 自动维护叙述）
-> 核心约束：canonical transcript 是永久事实源；唯一自动触发是 `compact_ratio`；缓存状态只影响成本与观测，不触发历史改写。
+> 状态：历史设计快照，不代表 `dsh-compaction-cacheaware@0.2.0` 已实现的功能。
+> 0.2.0 的实现范围与未移植机制见 [PROJECT.md](PROJECT.md#020-已实现范围)。
+
+> ⚠️ **历史文档（2026-08-10 快照）**：本文记录当时的上游设计。上游
+> `esengine/DeepSeek-Reasonix@main-v2` 之后已明显演进（当前同步于
+> `2a2dbbea`，2026-09-23）：触发比例 `0.85 → 0.80`、recent tail
+> `10% → 16%` 且取消 32K–96K 夹取、summary 上限 `16384 → 8192`，
+> 并**重新引入 prune-first**（先做免调用的持久 prune，清不掉触发线才跑 summary）。
+> 文中「不再存在 tool_result snip/prune 投影」等表述已过期；以
+> [UPSTREAM_SYNC_REPORT.md](UPSTREAM_SYNC_REPORT.md) 与
+> `vendor/reasonix/compact/` 为准。
 
 ## 一、问题与目标
 
@@ -14,7 +23,7 @@
 
 旧路径使用 soft / snip / force 多阈值，并在压力下自动安装 prune 投影或调用 provider native compaction。该路径把维护成本与可恢复性缠在一起，也会在 resume 时破坏缓存前缀。
 
-当前产品路径：
+当时记录的上游产品路径：
 
 ```text
 canonical transcript (Session.Messages，普通维护永不改写)

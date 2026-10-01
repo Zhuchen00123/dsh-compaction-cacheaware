@@ -39,7 +39,7 @@ jobs:
       - name: Detect changes
         id: git
         run: |
-          if ! git diff --quiet; then
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -60,8 +60,8 @@ jobs:
             - `vendor/reasonix/compact/` (compatible upstream compact source/docs)
             - `src/generated/reasonix-constants.ts` and compiled `lib/`
 
-            The sync is compatibility-gated: structural upstream rewrites are
-            skipped and reported for a manual port review. Local compact trigger
-            and recent-tail policy values are intentionally preserved.
-            Review the diff before merging.
+            The sync always refreshes the discovered upstream snapshot and writes
+            a report, including when the implementation shape changes. Review
+            the diff and port-drift report before merging; removed constants keep
+            their last local fallback only while the port still consumes them.
           labels: dependencies, reasonix

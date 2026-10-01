@@ -4,6 +4,17 @@
 #
 # Apply as a --patch overlay, or merge into your agent preset's compaction realm.
 #
+# Desktop (DSH 0.2.0-rc.2) is a different path: install the package through the
+# Desktop plugin manager, then replace the engine row inside EACH preset's
+# isolated compaction realm. This example does not do that, and a profile-level
+# bundle patch cannot reach an isolated realm. See docs/DESKTOP_MIGRATION.md.
+#
+# Geometry follows upstream Reasonix at the commit recorded in
+# src/generated/reasonix-constants.ts: one trigger ratio, one recent-tail ratio,
+# one summary budget, and a physical ceiling derived from protocolReserveTokens.
+# The former checkpoint ceiling, pinned-first-user turn, kept-user-turn, and
+# exceptional-savings knobs no longer exist upstream and are not configurable.
+#
 # - id: compaction-basic
 #   disabled: true
 #
@@ -11,9 +22,9 @@
 #     - id: compaction-cacheaware
 #       name: 'file:///F:/codexprojects/deepseek-harnes/packages/dsh-compaction-cacheaware/lib/index.js'
 #       config:
-#         compactRatio: 0.85
-#         checkpointCeilingRatio: 0.5
-#         recentTailRatio: 0.1
-#         recentTailMinTokens: 32768
-#         recentTailMaxTokens: 98304
-#         summaryMaxTokens: 16384
+#         compactRatio: 0.8
+#         recentTailRatio: 0.16
+#         summaryMaxTokens: 8192
+#         minRecentKeep: 2
+#         minCompactMessages: 2
+#         protocolReserveTokens: 256

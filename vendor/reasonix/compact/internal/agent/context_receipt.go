@@ -15,12 +15,20 @@ func (a *Agent) contextMaintenanceInputHash(visible []provider.Message) string {
 	if a == nil {
 		return ""
 	}
-	seed := a.currentPromptCacheKey() + "\n" + providerVisibleFingerprint(provider.ModelMessages(visible))
+	seed := a.currentPromptCacheKey() + "\n" + providerVisibleFingerprint(modelInputMessages(visible))
 	sum := sha256.Sum256([]byte(seed))
 	return hex.EncodeToString(sum[:])
 }
 
-func (a *Agent) contextMaintenanceBlocked(inputHash string) (bool, string) {
+// The same-turn backoff lifts once the changed view outgrows the failed
+// attempt by this share of the window. Growth is the only signal that a retry
+// can reclaim more, and it bounds the retries one turn can pay to a handful.
+const maintenanceRetryGrowthRatio = 0.05
+
+// contextMaintenanceBlocked reports whether the last receipt still suppresses
+// automatic maintenance of the view fingerprinted by inputHash. est is the
+// view's current estimate; zero means the caller has none and keeps the backoff.
+func (a *Agent) contextMaintenanceBlocked(inputHash string, est int) (bool, string) {
 	if a == nil {
 		return false, ""
 	}
@@ -43,12 +51,20 @@ func (a *Agent) contextMaintenanceBlocked(inputHash string) (bool, string) {
 	// on a later turn, but not once per tool result in the same active turn.
 	if r.BlockedInputHash != "" && inputHash != "" && r.BlockedInputHash != inputHash {
 		turn := a.activeTurnCreatedAt.Load()
-		if turn != 0 && a.sess.compaction.failedTurn.Load() == turn {
+		if turn != 0 && a.sess.compaction.failedTurn.Load() == turn && !a.maintenanceRetryDue(r, est) {
 			return true, reason
 		}
 		return false, ""
 	}
 	return true, reason
+}
+
+func (a *Agent) maintenanceRetryDue(r *ContextMaintenanceReceipt, est int) bool {
+	window := a.effectiveContextWindow()
+	if est <= 0 || window <= 0 || r.InputTokens <= 0 {
+		return false
+	}
+	return est >= r.InputTokens+int(float64(window)*maintenanceRetryGrowthRatio)
 }
 
 func (a *Agent) emitContextMaintenance(r *ContextMaintenanceReceipt) {
@@ -75,9 +91,11 @@ func (a *Agent) recordContextMaintenanceOutcome(inputHash, trigger, action, stat
 	if a == nil || a.sess.conversation == nil {
 		return
 	}
+	visible := a.modelVisibleMessages()
 	if inputHash == "" {
-		inputHash = a.contextMaintenanceInputHash(a.modelVisibleMessages())
+		inputHash = a.contextMaintenanceInputHash(visible)
 	}
+	inputTokens := a.estimatedVisibleRequestTokens(visible)
 	if trigger == "" {
 		trigger = CompactionTriggerPressure
 	}
@@ -120,7 +138,7 @@ func (a *Agent) recordContextMaintenanceOutcome(inputHash, trigger, action, stat
 		OperationID: fmt.Sprintf("%s-%s-%d", status, action, state.Generation), Status: status, Action: action,
 		Trigger: trigger, SourceProjection: state.Projection.ProjectionVersion,
 		ProjectionVersion: state.Projection.ProjectionVersion, InputHash: inputHash,
-		BlockedInputHash: inputHash, Reason: reason, CreatedAt: now,
+		InputTokens: inputTokens, BlockedInputHash: inputHash, Reason: reason, CreatedAt: now,
 	}
 	state.UpdatedAt = now
 	a.sess.compactionState = state
@@ -135,16 +153,16 @@ func (a *Agent) recordContextMaintenanceOutcome(inputHash, trigger, action, stat
 }
 
 func (a *Agent) emitCompactionTelemetry(t CompactionTelemetry) {
-	detail := fmt.Sprintf("trigger=%s mode=%s cache=%s src=%d fold=%d spans=%d proj=%d in=%d out=%d hit=%d miss=%d write=%d reqs=%d user_kept=%d user_dropped=%d",
-		t.Trigger, t.Mode, t.CacheState, t.SourceTokens, t.FoldTokens, t.Spans, t.ProjectionTokens,
+	detail := fmt.Sprintf("trigger=%s mode=%s summary_input=%s cache=%s src=%d fold=%d spans=%d proj=%d in=%d out=%d hit=%d miss=%d write=%d reqs=%d user_kept=%d user_dropped=%d",
+		t.Trigger, t.Mode, t.SummaryInputMode, t.CacheState, t.SourceTokens, t.FoldTokens, t.Spans, t.ProjectionTokens,
 		t.InputTokens, t.OutputTokens, t.CacheHitTokens, t.CacheMissTokens, t.CacheWriteTokens, t.RequestCount,
 		t.UserTurnsKept, t.UserTurnsDropped)
 	if t.ProviderRequestID != "" {
 		detail += " provider_request_id=" + t.ProviderRequestID
 	}
 	if t.Error != "" {
-		// A degraded fold carries the summarizer's error but still freed the
-		// context, so it is a notice with a cause rather than a failure.
+		// CompactionModeDegraded remains readable for legacy telemetry, although
+		// new summarizer failures never install a degraded projection.
 		if t.Mode != CompactionModeDegraded {
 			slog.Warn("agent: compaction failed", "detail", detail+" err_type="+t.Error)
 			return
